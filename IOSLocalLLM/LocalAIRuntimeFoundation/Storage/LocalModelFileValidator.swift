@@ -397,6 +397,10 @@ enum LocalModelFileValidator {
         let handle: FileHandle
         private var offset: UInt64 = 0
 
+        init(handle: FileHandle) {
+            self.handle = handle
+        }
+
         mutating func readBytes(count: Int) -> Data? {
             guard count >= 0 else { return nil }
             if count == 0 { return Data() }

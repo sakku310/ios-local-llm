@@ -5066,7 +5066,7 @@ actor LocalAPIServer {
 
             var output = ""
             output.reserveCapacity(min(maxTokens * 4, 256 * 1_024))
-            var parsedOutput = LocalAPIReasoningDelta(reasoning: "", content: "")
+            var parsedOutput = LocalAPIReasoningResult(reasoning: "", content: "")
             var cleanedOutput = ""
             var parsedToolCalls = LocalAPIToolCallParseResult(calls: [], failure: nil, dialect: "none")
             var detectedCalls: [LocalAPIToolCall] = []
