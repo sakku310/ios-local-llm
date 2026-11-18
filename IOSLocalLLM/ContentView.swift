@@ -66,6 +66,7 @@ struct LocalAPIServerView: View {
                             keepScreenAwake: $keepScreenAwake,
                             autoLoadModel: $autoLoadModel,
                             toolCallingEnabled: $toolCallingEnabled,
+                            webSearchToolsEnabled: $webSearchToolsEnabled,
                             reasoningEnabled: $reasoningEnabled,
                             parallelToolCallsLimit: $parallelToolCallsLimit,
                             strictToolSchemasEnabled: $strictToolSchemasEnabled,
@@ -630,6 +631,7 @@ private struct LASHomeServerCard: View {
     @Binding var keepScreenAwake: Bool
     @Binding var autoLoadModel: Bool
     @Binding var toolCallingEnabled: Bool
+    @Binding var webSearchToolsEnabled: Bool
     @Binding var reasoningEnabled: Bool
     @Binding var parallelToolCallsLimit: Int
     @Binding var strictToolSchemasEnabled: Bool
