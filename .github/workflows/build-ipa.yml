@@ -119,6 +119,109 @@ jobs:
             copying { print }
           ' "${llama_root}/build-xcframework.sh" > "${helper_file}"
 
+          # Normalize ONLY combine_static_libraries() -> case "$platform" -> "ios") -> is_simulator == "true"
+          # inside the temporary helper_file so the Simulator slice links arm64-only (matching CMake),
+          # without modifying ThirdParty/llama.cpp/build-xcframework.sh.
+          python3 - "${helper_file}" <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          helper_path = pathlib.Path(sys.argv[1])
+          before = helper_path.read_text(encoding="utf-8")
+
+          func_matches = list(re.finditer(r"^combine_static_libraries\(\)\s*\{", before, flags=re.MULTILINE))
+          if len(func_matches) != 1:
+              raise SystemExit(
+                  f"error: expected 1 combine_static_libraries() definition in {helper_path}, found {len(func_matches)}"
+              )
+          combine_start = func_matches[0].start()
+
+          target_ios_block = (
+              '        "ios")\n'
+              '            if [[ "$is_simulator" == "true" ]]; then\n'
+              '                sdk="iphonesimulator"\n'
+              '                archs="arm64 x86_64"\n'
+              '                min_version_flag="-mios-simulator-version-min=${IOS_MIN_OS_VERSION}"\n'
+              '            else\n'
+              '                sdk="iphoneos"\n'
+              '                archs="arm64"\n'
+              '                min_version_flag="-mios-version-min=${IOS_MIN_OS_VERSION}"\n'
+              '            fi\n'
+              '            install_name="@rpath/llama.framework/llama"\n'
+              '            ;;\n'
+          )
+          replacement_ios_block = (
+              '        "ios")\n'
+              '            if [[ "$is_simulator" == "true" ]]; then\n'
+              '                sdk="iphonesimulator"\n'
+              '                archs="arm64"\n'
+              '                min_version_flag="-mios-simulator-version-min=${IOS_MIN_OS_VERSION}"\n'
+              '            else\n'
+              '                sdk="iphoneos"\n'
+              '                archs="arm64"\n'
+              '                min_version_flag="-mios-version-min=${IOS_MIN_OS_VERSION}"\n'
+              '            fi\n'
+              '            install_name="@rpath/llama.framework/llama"\n'
+              '            ;;\n'
+          )
+
+          occurrences = before.count(target_ios_block)
+          if occurrences != 1:
+              raise SystemExit(
+                  f"error: expected target iOS simulator/device block once in {helper_path}, found {occurrences}"
+              )
+          block_offset = before.index(target_ios_block)
+          if block_offset <= combine_start:
+              raise SystemExit("error: target iOS block is outside combine_static_libraries()")
+
+          patched = (
+              before[:block_offset]
+              + replacement_ios_block
+              + before[block_offset + len(target_ios_block):]
+          )
+          helper_path.write_text(patched, encoding="utf-8")
+
+          after = helper_path.read_text(encoding="utf-8")
+          if after.count(replacement_ios_block) != 1 or target_ios_block in after:
+              raise SystemExit("error: post-write verification failed for normalized iOS block")
+
+          after_offset = after.index(replacement_ios_block)
+          ios_after = after[after_offset:after_offset + len(replacement_ios_block)]
+          sim_part, device_part = ios_after.split("            else\n", 1)
+
+          if "x86_64" in sim_part:
+              raise SystemExit("error: x86_64 remained in iOS simulator branch")
+          if 'sdk="iphonesimulator"' not in sim_part or 'archs="arm64"' not in sim_part:
+              raise SystemExit("error: arm64 simulator settings missing after normalization")
+
+          expected_device_part = (
+              '                sdk="iphoneos"\n'
+              '                archs="arm64"\n'
+              '                min_version_flag="-mios-version-min=${IOS_MIN_OS_VERSION}"\n'
+              '            fi\n'
+              '            install_name="@rpath/llama.framework/llama"\n'
+              '            ;;\n'
+          )
+          if device_part != expected_device_part:
+              raise SystemExit("error: iOS device branch was unexpectedly altered")
+
+          unchanged_prefix = before[:block_offset] == after[:after_offset]
+          unchanged_suffix = (
+              before[block_offset + len(target_ios_block):]
+              == after[after_offset + len(replacement_ios_block):]
+          )
+          if not (unchanged_prefix and unchanged_suffix):
+              raise SystemExit("error: helper content outside iOS block was unexpectedly modified")
+
+          print(
+              "Verified helper_file normalization: combine_static_libraries() iOS simulator archs='arm64' "
+              "(device branch and all other sections unchanged)"
+          )
+          PY
+          bash -n "${helper_file}"
+          git -C "${llama_root}" diff --exit-code -- build-xcframework.sh
+
           (
             cd "${llama_root}"
             # shellcheck disable=SC1090
@@ -185,17 +288,36 @@ jobs:
           )
 
           xcframework_dir="${llama_root}/build-apple/llama.xcframework"
-          device_binary="${xcframework_dir}/ios-arm64/llama.framework/llama"
-          sim_binary="${xcframework_dir}/ios-arm64-simulator/llama.framework/llama"
-          if [[ ! -s "${device_binary}" ]]; then
-            echo "error: expected device framework binary not found at ${device_binary}" >&2
-            exit 1
-          fi
-          if [[ ! -s "${sim_binary}" ]]; then
-            echo "error: expected simulator framework binary not found at ${sim_binary}" >&2
+          if [[ ! -d "${xcframework_dir}" ]]; then
+            echo "error: expected XCFramework directory not found at ${xcframework_dir}" >&2
             exit 1
           fi
           ls -la "${xcframework_dir}"
+
+          device_binary="${xcframework_dir}/ios-arm64/llama.framework/llama"
+          sim_binary="${xcframework_dir}/ios-arm64-simulator/llama.framework/llama"
+          if [[ ! -s "${device_binary}" ]]; then
+            echo "error: expected non-empty device framework binary not found at ${device_binary}" >&2
+            exit 1
+          fi
+          if [[ ! -s "${sim_binary}" ]]; then
+            echo "error: expected non-empty simulator framework binary not found at ${sim_binary}" >&2
+            exit 1
+          fi
+          ls -lh "${device_binary}" "${sim_binary}"
+
+          device_archs="$(lipo -archs "${device_binary}")"
+          sim_archs="$(lipo -archs "${sim_binary}")"
+          echo "XCFramework device slice architectures: ${device_archs}"
+          echo "XCFramework simulator slice architectures: ${sim_archs}"
+          if [[ "${device_archs}" != "arm64" ]]; then
+            echo "error: expected arm64-only device framework binary, got '${device_archs}'" >&2
+            exit 1
+          fi
+          if [[ "${sim_archs}" != "arm64" ]]; then
+            echo "error: expected arm64-only simulator framework binary, got '${sim_archs}'" >&2
+            exit 1
+          fi
 
           rm -rf "${llama_root}/build-ios-sim" "${llama_root}/build-ios-device"
           df -h

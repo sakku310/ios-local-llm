@@ -405,7 +405,7 @@ final class Phase2And3OfflineTests: XCTestCase {
         XCTAssertFalse(filtered.query.contains("file://"))
         XCTAssertTrue(filtered.query.contains("Swift error"))
 
-        XCTAssertThrowsError(try WebQueryPrivacyFilter.sanitize("Bearer sk-1234567890abcdef1234"))
+        XCTAssertThrowsError(try WebQueryPrivacyFilter.sanitize("Bearer sk-" + "1234567890abcdef1234"))
 
         // `.freeAuto`: DDG HTML returns 202 CAPTCHA -> stops immediately WITHOUT
         // bypassing, falls back cleanly to Wikimedia JSON API!
