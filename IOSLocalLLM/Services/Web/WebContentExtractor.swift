@@ -64,7 +64,7 @@ public actor WebContentExtractor {
         // 2. Pull preformatted blocks separately so code is preserved verbatim.
         var codeBlocks: [String] = []
         body = body.replacingOccurrences(of: "<pre[^>]*>([\\s\\S]*?)</pre>",
-                                         with: "<<<<PRE_BLOCK>>>>",
+                                         with: "ZZZZ_PRE_BLOCK_ZZZZ",
                                          options: .regularExpression)
         if let pat = try? NSRegularExpression(pattern: "<pre[^>]*>([\\s\\S]*?)</pre>") {
             let ns = html as NSString
@@ -84,12 +84,12 @@ public actor WebContentExtractor {
 
         // 4. Re-interleave code blocks as fenced markdown.
         var i = 0
-        while text.contains("<<<<PRE_BLOCK>>>>"), i < codeBlocks.count {
+        while text.contains("ZZZZ_PRE_BLOCK_ZZZZ"), i < codeBlocks.count {
             text = text.replacingOccurrences(
-                of: "<<<<PRE_BLOCK>>>>",
+                of: "ZZZZ_PRE_BLOCK_ZZZZ",
                 with: "\n\n```\n\(codeBlocks[i])\n```\n\n",
                 options: .literal,
-                range: text.range(of: "<<<<PRE_BLOCK>>>>")
+                range: text.range(of: "ZZZZ_PRE_BLOCK_ZZZZ")
             )
             i += 1
         }

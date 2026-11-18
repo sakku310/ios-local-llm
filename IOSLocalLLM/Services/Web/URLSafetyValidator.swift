@@ -192,8 +192,17 @@ public actor URLSafetyValidator {
 
     private static func isPrivateIPv4(_ ip: String) -> Bool {
         // Reject octal/hex/short-form IPv4 literals (`0177.0.0.1`, `127.1`, `2130706433`)
-        // because `inet_pton(AF_INET, ...)` accepts only canonical dotted-quad,
-        // so non-canonical numeric hosts fail closed (`return true`).
+        // because Darwin `inet_pton(AF_INET, ...)` can accept leading zeros as decimal
+        // and non-standard forms must fail closed (`return true`).
+        let parts = ip.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count == 4 else { return true }
+        for part in parts {
+            guard !part.isEmpty, part.allSatisfy(\.isNumber) else { return true }
+            if part.count > 1, part.first == "0" { return true } // leading zero / octal syntax
+            guard let val = UInt8(part) else { return true } // must fit 0...255
+            _ = val
+        }
+
         var addr = in_addr()
         let parsed = ip.withCString { inet_pton(AF_INET, $0, &addr) }
         guard parsed == 1 else { return true }

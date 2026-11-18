@@ -875,7 +875,7 @@ final class DeviceTierAdvisorTests: XCTestCase {
         XCTAssertTrue(policy.storageBacked)
         XCTAssertEqual(
             policy.minimumAvailableBytes,
-            GGUFLoadPolicy.storageBackedHeadroom
+            4_702_017_623
         )
     }
 

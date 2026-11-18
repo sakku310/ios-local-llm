@@ -81,7 +81,7 @@ public struct WebContentSanitizer: Sendable {
 
         // 2. "Ignore previous" style override attempts.
         let overridePatterns: [String] = [
-            "(?i)ignore\\s+(?:all\\s+|previous\\s+|above\\s+|prior\\s+)?(?:instructions|rules|prompts|directives|context)",
+            "(?i)ignore\\s+(?:(?:all|previous|above|prior)\\s+)*(?:instructions|rules|prompts|directives|context)",
             "(?i)disregard\\s+(?:the\\s+)?(?:system|previous|prior|above)",
             "(?i)forget\\s+(?:everything|all\\s+previous|the\\s+above)",
             "(?i)you\\s+are\\s+now\\s+(?:dan|jailbroken|in\\s+developer\\s+mode)",
@@ -173,12 +173,12 @@ public enum WebQueryPrivacyFilter {
         var redacted = false
         let secretPatterns: [(pattern: String, reason: String)] = [
             // OnDeviceLAS local API keys & common bearer tokens
+            (#"(?i)\bbearer\s+[A-Za-z0-9._\-]{8,}"#, "Authorization bearer token"),
             (#"\bodl_[A-Za-z0-9_\-]{8,}\b"#, "local API key"),
             (#"\bsk-[A-Za-z0-9_\-]{12,}\b"#, "API secret key"),
             (#"\bgh[pousr]_[A-Za-z0-9]{16,}\b"#, "GitHub token"),
             (#"\bhf_[A-Za-z0-9]{16,}\b"#, "Hugging Face token"),
             (#"\bAIza[0-9A-Za-z_\-]{20,}\b"#, "cloud API key"),
-            (#"(?i)\bbearer\s+[A-Za-z0-9._\-]{8,}"#, "Authorization bearer token"),
             (#"(?i)\bx-api-key\s*[:=]\s*\S+"#, "X-API-Key header"),
             // Local file URLs & iOS/macOS/Linux private paths
             (#"(?i)\bfile://[^\s]+"#, "file:// URL"),

@@ -114,7 +114,7 @@ final class Phase2And3OfflineTests: XCTestCase {
         XCTAssertTrue(noThinkPrompt.contains("<|im_start|>system\nYou are a concise assistant.<|im_end|>\n"))
         XCTAssertTrue(noThinkPrompt.contains("<function=get_weather>"))
         XCTAssertTrue(noThinkPrompt.contains("<parameter=city>\nTokyo\n</parameter>"))
-        XCTAssertTrue(noThinkPrompt.contains("<|im_start|>user\n<tool_response>\n{\"temp_c\":22,\"condition\":\"Sunny\"}\n</tool_response>\n<|im_end|>\n"))
+        XCTAssertTrue(noThinkPrompt.contains("<|im_start|>user\n<tool_response>\n{\"temp_c\":22,\"condition\":\"Sunny\"}\n</tool_response><|im_end|>\n"))
         XCTAssertTrue(noThinkPrompt.hasSuffix("<|im_start|>assistant\n<think>\n\n</think>\n\n"))
 
         let thinkPrompt = template.format(messages: messages, enableThinking: true)
