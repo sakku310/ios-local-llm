@@ -251,6 +251,7 @@ targets:
       - path: IOSLocalLLMTests/LASAppIdentityTests.swift
       - path: IOSLocalLLMTests/Int64FormattedBytesTests.swift
       - path: IOSLocalLLMTests/URLSafetyValidatorTests.swift
+      - path: IOSLocalLLMTests/Phase2And3IntegrationTests.swift
     dependencies:
       - target: OnDeviceLAS
     settings:

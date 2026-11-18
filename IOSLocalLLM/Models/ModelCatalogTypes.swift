@@ -895,6 +895,10 @@ enum LocalModelRegistry {
     private static func supportsThinking(repoID: String) -> Bool {
         let lower = repoID.lowercased()
         return lower.contains("qwen3")
+            || lower.contains("qwen-3.5")
+            || lower.contains("gemma-4")
+            || lower.contains("gemma4")
+            || lower.contains("gemma_4")
             || lower.contains("thinking")
             || lower.contains("deepseek-r1")
             || lower.contains("phi-4")
@@ -936,6 +940,9 @@ enum ModelFamily {
         // get absorbed into "qwen3".
         let patterns: [(needle: String, family: String)] = [
             ("bonsai",         "bonsai"),
+            ("qwen3.5",         "qwen3.5"),
+            ("qwen3_5",         "qwen3.5"),
+            ("qwen-3.5",        "qwen3.5"),
             ("qwen3-vl",        "qwen3-vl"),
             ("qwen2.5-vl",      "qwen2.5-vl"),
             ("qwen2-vl",        "qwen2-vl"),
@@ -948,6 +955,9 @@ enum ModelFamily {
             ("smollm3",         "smollm3"),
             ("smollm2",         "smollm2"),
             ("smollm",          "smollm"),
+            ("gemma-4",         "gemma-4"),
+            ("gemma4",          "gemma-4"),
+            ("gemma_4",         "gemma-4"),
             ("gemma-3n",        "gemma-3n"),
             ("gemma-3",         "gemma-3"),
             ("gemma-2",         "gemma-2"),
@@ -977,6 +987,7 @@ enum ModelFamily {
     static func displayName(forID id: String) -> String {
         let map: [String: String] = [
             "bonsai":          "Bonsai",
+            "qwen3.5":         "Qwen 3.5",
             "qwen3-vl":        "Qwen 3 VL",
             "qwen2.5-vl":      "Qwen 2.5 VL",
             "qwen2-vl":        "Qwen 2 VL",
@@ -989,6 +1000,7 @@ enum ModelFamily {
             "smollm3":         "SmolLM 3",
             "smollm2":         "SmolLM 2",
             "smollm":          "SmolLM",
+            "gemma-4":         "Gemma 4",
             "gemma-3n":        "Gemma 3n",
             "gemma-3":         "Gemma 3",
             "gemma-2":         "Gemma 2",

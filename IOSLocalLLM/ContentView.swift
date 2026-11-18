@@ -16,6 +16,7 @@ struct LocalAPIServerView: View {
     @AppStorage("localAPIReasoningEnabled") private var reasoningEnabled = false
     @AppStorage("localAPIParallelToolCallsLimit") private var parallelToolCallsLimit = 2
     @AppStorage("localAPIStrictToolSchemasEnabled") private var strictToolSchemasEnabled = true
+    @AppStorage("localAPIWebSearchEnabled") private var webSearchToolsEnabled = false
 
     @State private var portText = "11434"
     @State private var apiKeyVisible = false
@@ -838,6 +839,9 @@ private struct LASHomeServerCard: View {
                 .frame(minHeight: 44)
             Toggle("Tool calling", isOn: $toolCallingEnabled)
                 .frame(minHeight: 44)
+            Toggle("Built-in Web search tools", isOn: $webSearchToolsEnabled)
+                .frame(minHeight: 44)
+                .disabled(!toolCallingEnabled)
             Toggle("Allow model reasoning", isOn: $reasoningEnabled)
                 .frame(minHeight: 44)
             Menu {

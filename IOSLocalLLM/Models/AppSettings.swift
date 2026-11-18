@@ -164,6 +164,14 @@ final class AppSettings: ObservableObject {
     /// Validate model-produced arguments against the request's JSON schemas
     /// before returning a call to Hermes or another client.
     @AppStorage("localAPIStrictToolSchemasEnabled") var localAPIStrictToolSchemasEnabled: Bool = true
+    /// Optional server-executed Web search & page fetch tools (`web_search`,
+    /// `web_fetch`) on `/v1/chat/completions` and `/v1/responses`. Defaults to
+    /// `false` so normal offline local inference is never altered unless the
+    /// user enables this toggle or the API caller opts in per request.
+    @AppStorage("localAPIWebSearchEnabled") var localAPIWebSearchEnabled: Bool = false
+    /// Default keyless search provider for API Web search (`freeAuto`, `wikimedia`,
+    /// `duckduckgoInstant`, `duckduckgoHTML`, `searxng`, `custom`).
+    @AppStorage("localAPIWebSearchProvider") var localAPIWebSearchProvider: String = WebSearchProvider.freeAuto.rawValue
 
     // FastVLM pipeline
     // OCR fallback defaults OFF: the lens starts in visual (describe) mode, so

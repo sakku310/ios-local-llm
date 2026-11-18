@@ -155,6 +155,83 @@ enum LocalAPIReasoningPreference: Equatable, Sendable {
     }
 }
 
+enum LocalAPIWebSearchMode: Equatable, Sendable {
+    case automatic
+    case enabled
+    case disabled
+
+    func isEnabled(globalEnabled: Bool) -> Bool {
+        switch self {
+        case .enabled: true
+        case .disabled: false
+        case .automatic: globalEnabled
+        }
+    }
+}
+
+struct LocalAPIWebToolResolution: Equatable, Sendable {
+    let effectiveTools: [LocalAPIToolDefinition]
+    let effectiveChoice: LocalAPIToolChoice
+    let serverExecutedToolNames: Set<String>
+
+    static var builtInDefinitions: [LocalAPIToolDefinition] {
+        LocalAPIWebToolCoordinator.builtInToolDefinitions().map {
+            LocalAPIToolDefinition(
+                name: $0.name,
+                description: $0.description,
+                parametersJSON: $0.parametersJSON
+            )
+        }
+    }
+
+    static func resolve(
+        requestTools: [LocalAPIToolDefinition],
+        requestChoice: LocalAPIToolChoice,
+        explicitChoiceProvided: Bool,
+        webSearchMode: LocalAPIWebSearchMode,
+        globalWebSearchEnabled: Bool,
+        globalToolCallingEnabled: Bool
+    ) -> Self {
+        guard globalToolCallingEnabled else {
+            return .init(
+                effectiveTools: requestTools,
+                effectiveChoice: requestChoice,
+                serverExecutedToolNames: []
+            )
+        }
+        guard !(explicitChoiceProvided && requestChoice == .none) else {
+            return .init(
+                effectiveTools: requestTools,
+                effectiveChoice: .none,
+                serverExecutedToolNames: []
+            )
+        }
+        guard webSearchMode.isEnabled(globalEnabled: globalWebSearchEnabled) else {
+            return .init(
+                effectiveTools: requestTools,
+                effectiveChoice: requestChoice,
+                serverExecutedToolNames: []
+            )
+        }
+
+        let clientToolNames = Set(requestTools.map(\.name))
+        var merged = requestTools
+        var serverOwned = Set<String>()
+        for builtin in builtInDefinitions where !clientToolNames.contains(builtin.name) {
+            merged.append(builtin)
+            serverOwned.insert(builtin.name)
+        }
+        let resolvedChoice: LocalAPIToolChoice = (requestChoice == .none && !explicitChoiceProvided && !merged.isEmpty)
+            ? .auto
+            : requestChoice
+        return .init(
+            effectiveTools: merged,
+            effectiveChoice: resolvedChoice,
+            serverExecutedToolNames: serverOwned
+        )
+    }
+}
+
 struct LocalAPIChatRequest {
     let model: String
     let messages: [ChatMessage]
@@ -167,12 +244,19 @@ struct LocalAPIChatRequest {
     let topP: Double?
     let tools: [LocalAPIToolDefinition]
     let toolChoice: LocalAPIToolChoice
+    let explicitToolChoice: Bool
     let parallelToolCalls: Bool
+    let webSearchMode: LocalAPIWebSearchMode
 
     static func decodeOpenAI(_ data: Data) throws -> Self {
         let raw = try object(data)
-        let tools = try decodeOpenAITools(raw["tools"])
-        let toolChoice = try decodeOpenAIToolChoice(raw["tool_choice"], tools: tools)
+        let decodedTools = try decodeOpenAIToolsWithBuiltIns(raw["tools"])
+        let tools = decodedTools.tools
+        let toolChoice = try decodeOpenAIToolChoice(
+            raw["tool_choice"],
+            tools: tools,
+            allowBuiltInWebTools: decodedTools.requestedBuiltInWebSearch
+        )
         guard let model = raw["model"] as? String, !model.isEmpty,
               let rows = raw["messages"] as? [[String: Any]], !rows.isEmpty else {
             throw LocalAPIProtocolError.malformed("model and messages are required")
@@ -191,7 +275,12 @@ struct LocalAPIChatRequest {
             topP: number(raw["top_p"]),
             tools: tools,
             toolChoice: toolChoice,
-            parallelToolCalls: raw["parallel_tool_calls"] as? Bool ?? true
+            explicitToolChoice: raw["tool_choice"] != nil,
+            parallelToolCalls: raw["parallel_tool_calls"] as? Bool ?? true,
+            webSearchMode: decodeWebSearchMode(
+                raw,
+                builtInToolRequested: decodedTools.requestedBuiltInWebSearch
+            )
         )
     }
 
@@ -202,10 +291,12 @@ struct LocalAPIChatRequest {
             throw LocalAPIProtocolError.malformed("model and input are required")
         }
 
-        let tools = try decodeResponseTools(raw["tools"])
+        let decodedTools = try decodeResponseToolsWithBuiltIns(raw["tools"])
+        let tools = decodedTools.tools
         let toolChoice = try decodeOpenAIResponsesToolChoice(
             raw["tool_choice"],
-            tools: tools
+            tools: tools,
+            allowBuiltInWebTools: decodedTools.requestedBuiltInWebSearch
         )
 
         var messages: [ChatMessage] = []
@@ -233,7 +324,12 @@ struct LocalAPIChatRequest {
             topP: number(raw["top_p"]),
             tools: tools,
             toolChoice: toolChoice,
-            parallelToolCalls: raw["parallel_tool_calls"] as? Bool ?? true
+            explicitToolChoice: raw["tool_choice"] != nil,
+            parallelToolCalls: raw["parallel_tool_calls"] as? Bool ?? true,
+            webSearchMode: decodeWebSearchMode(
+                raw,
+                builtInToolRequested: decodedTools.requestedBuiltInWebSearch
+            )
         )
     }
 
@@ -244,7 +340,7 @@ struct LocalAPIChatRequest {
         }
         let model = raw["model"] as? String ?? ""
         let options = raw["options"] as? [String: Any] ?? [:]
-        let tools = try decodeOpenAITools(raw["tools"])
+        let tools = try decodeOpenAIToolsWithBuiltIns(raw["tools"]).tools
         return Self(
             model: model,
             messages: try decodeOllamaMessages(rows),
@@ -257,7 +353,9 @@ struct LocalAPIChatRequest {
             topP: number(options["top_p"]),
             tools: tools,
             toolChoice: tools.isEmpty ? .none : .auto,
-            parallelToolCalls: raw["parallel_tool_calls"] as? Bool ?? true
+            explicitToolChoice: false,
+            parallelToolCalls: raw["parallel_tool_calls"] as? Bool ?? true,
+            webSearchMode: decodeWebSearchMode(raw, builtInToolRequested: false)
         )
     }
 
@@ -293,7 +391,9 @@ struct LocalAPIChatRequest {
             topP: number(options["top_p"]),
             tools: [],
             toolChoice: .none,
-            parallelToolCalls: false
+            explicitToolChoice: true,
+            parallelToolCalls: false,
+            webSearchMode: .disabled
         )
     }
 
@@ -323,8 +423,30 @@ struct LocalAPIChatRequest {
             topP: number(raw["top_p"]),
             tools: tools,
             toolChoice: toolChoice,
-            parallelToolCalls: !((raw["tool_choice"] as? [String: Any])?["disable_parallel_tool_use"] as? Bool ?? false)
+            explicitToolChoice: raw["tool_choice"] != nil,
+            parallelToolCalls: !((raw["tool_choice"] as? [String: Any])?["disable_parallel_tool_use"] as? Bool ?? false),
+            webSearchMode: decodeWebSearchMode(raw, builtInToolRequested: false)
         )
+    }
+
+    private static func decodeWebSearchMode(
+        _ raw: [String: Any],
+        builtInToolRequested: Bool
+    ) -> LocalAPIWebSearchMode {
+        if builtInToolRequested { return .enabled }
+        if let explicit = raw["web_search"] as? Bool {
+            return explicit ? .enabled : .disabled
+        }
+        if let explicit = raw["enable_web_search"] as? Bool {
+            return explicit ? .enabled : .disabled
+        }
+        if let options = raw["web_search_options"] as? [String: Any] {
+            if let enabled = options["enabled"] as? Bool {
+                return enabled ? .enabled : .disabled
+            }
+            return .enabled
+        }
+        return .automatic
     }
 
     private static func object(_ data: Data) throws -> [String: Any] {
@@ -364,18 +486,27 @@ struct LocalAPIChatRequest {
         return .automatic
     }
 
-    private static func decodeOpenAITools(_ value: Any?) throws -> [LocalAPIToolDefinition] {
-        guard let value else { return [] }
+    private static func decodeOpenAIToolsWithBuiltIns(
+        _ value: Any?
+    ) throws -> (tools: [LocalAPIToolDefinition], requestedBuiltInWebSearch: Bool) {
+        guard let value else { return ([], false) }
         guard let rows = value as? [[String: Any]] else {
             throw LocalAPIProtocolError.malformed("tools must be an array")
         }
-        return try rows.map { row in
-            guard row["type"] as? String == "function",
+        var definitions: [LocalAPIToolDefinition] = []
+        var requestedBuiltInWeb = false
+        for row in rows {
+            let type = (row["type"] as? String)?.lowercased()
+            if type == "web_search" || type == "web_search_preview" || type == "web_search_2025_03_11" {
+                requestedBuiltInWeb = true
+                continue
+            }
+            guard type == "function",
                   let function = row["function"] as? [String: Any],
                   let name = function["name"] as? String,
                   !name.isEmpty else {
                 throw LocalAPIProtocolError.malformed(
-                    "Each tool must be a named function."
+                    "Each tool must be a named function or web_search."
                 )
             }
             let parameters = function["parameters"] ?? [
@@ -392,25 +523,35 @@ struct LocalAPIChatRequest {
                     "Tool '\(name)' has an invalid parameters schema."
                 )
             }
-            return LocalAPIToolDefinition(
+            definitions.append(LocalAPIToolDefinition(
                 name: name,
                 description: function["description"] as? String,
                 parametersJSON: parametersJSON
-            )
+            ))
         }
+        return (definitions, requestedBuiltInWeb)
     }
 
-    private static func decodeResponseTools(_ value: Any?) throws -> [LocalAPIToolDefinition] {
-        guard let value else { return [] }
+    private static func decodeResponseToolsWithBuiltIns(
+        _ value: Any?
+    ) throws -> (tools: [LocalAPIToolDefinition], requestedBuiltInWebSearch: Bool) {
+        guard let value else { return ([], false) }
         guard let rows = value as? [[String: Any]] else {
             throw LocalAPIProtocolError.malformed("tools must be an array")
         }
-        return try rows.map { row in
-            guard row["type"] as? String == "function",
+        var definitions: [LocalAPIToolDefinition] = []
+        var requestedBuiltInWeb = false
+        for row in rows {
+            let type = (row["type"] as? String)?.lowercased()
+            if type == "web_search" || type == "web_search_preview" || type == "web_search_2025_03_11" {
+                requestedBuiltInWeb = true
+                continue
+            }
+            guard type == "function",
                   let name = row["name"] as? String,
                   !name.isEmpty else {
                 throw LocalAPIProtocolError.malformed(
-                    "Each Responses API tool must be a named function."
+                    "Each Responses API tool must be a named function or web_search."
                 )
             }
             let parameters = row["parameters"] ?? [
@@ -427,25 +568,28 @@ struct LocalAPIChatRequest {
                     "Tool '\(name)' has an invalid parameters schema."
                 )
             }
-            return LocalAPIToolDefinition(
+            definitions.append(LocalAPIToolDefinition(
                 name: name,
                 description: row["description"] as? String,
                 parametersJSON: parametersJSON
-            )
+            ))
         }
+        return (definitions, requestedBuiltInWeb)
     }
 
     private static func decodeOpenAIResponsesToolChoice(
         _ value: Any?,
-        tools: [LocalAPIToolDefinition]
+        tools: [LocalAPIToolDefinition],
+        allowBuiltInWebTools: Bool = false
     ) throws -> LocalAPIToolChoice {
-        guard let value else { return tools.isEmpty ? .none : .auto }
+        let hasAnyTools = !tools.isEmpty || allowBuiltInWebTools
+        guard let value else { return hasAnyTools ? .auto : .none }
         if let string = value as? String {
             switch string {
-            case "auto": return tools.isEmpty ? .none : .auto
+            case "auto": return hasAnyTools ? .auto : .none
             case "none": return .none
             case "required":
-                guard !tools.isEmpty else {
+                guard hasAnyTools else {
                     throw LocalAPIProtocolError.malformed(
                         "tool_choice requires at least one tool."
                     )
@@ -457,6 +601,12 @@ struct LocalAPIChatRequest {
                 )
             }
         }
+        if let object = value as? [String: Any],
+           let type = (object["type"] as? String)?.lowercased(),
+           (type == "web_search" || type == "web_search_preview"),
+           allowBuiltInWebTools {
+            return .function(LocalAPIWebToolCoordinator.webSearchToolName)
+        }
         guard let object = value as? [String: Any],
               object["type"] as? String == "function",
               let name = object["name"] as? String,
@@ -465,7 +615,8 @@ struct LocalAPIChatRequest {
                 "Responses API tool_choice must be auto, none, required, or a named function."
             )
         }
-        guard tools.contains(where: { $0.name == name }) else {
+        guard tools.contains(where: { $0.name == name })
+                || (allowBuiltInWebTools && LocalAPIWebToolCoordinator.isBuiltInWebToolName(name)) else {
             throw LocalAPIProtocolError.malformed(
                 "tool_choice references unknown function '\(name)'."
             )
@@ -550,9 +701,11 @@ struct LocalAPIChatRequest {
 
     private static func decodeOpenAIToolChoice(
         _ value: Any?,
-        tools: [LocalAPIToolDefinition]
+        tools: [LocalAPIToolDefinition],
+        allowBuiltInWebTools: Bool = false
     ) throws -> LocalAPIToolChoice {
-        guard let value else { return tools.isEmpty ? .none : .auto }
+        let hasAnyTools = !tools.isEmpty || allowBuiltInWebTools
+        guard let value else { return hasAnyTools ? .auto : .none }
         let choice: LocalAPIToolChoice
         if let string = value as? String {
             switch string {
@@ -564,6 +717,11 @@ struct LocalAPIChatRequest {
                     "tool_choice must be auto, none, required, or a named function."
                 )
             }
+        } else if let object = value as? [String: Any],
+                  let type = (object["type"] as? String)?.lowercased(),
+                  (type == "web_search" || type == "web_search_preview"),
+                  allowBuiltInWebTools {
+            choice = .function(LocalAPIWebToolCoordinator.webSearchToolName)
         } else if let object = value as? [String: Any],
                   object["type"] as? String == "function",
                   let function = object["function"] as? [String: Any],
@@ -577,11 +735,12 @@ struct LocalAPIChatRequest {
         }
 
         switch choice {
-        case .auto where tools.isEmpty, .required where tools.isEmpty:
+        case .auto where !hasAnyTools, .required where !hasAnyTools:
             throw LocalAPIProtocolError.malformed(
                 "tool_choice requires at least one tool."
             )
-        case .function(let name) where !tools.contains(where: { $0.name == name }):
+        case .function(let name) where !tools.contains(where: { $0.name == name })
+                && !(allowBuiltInWebTools && LocalAPIWebToolCoordinator.isBuiltInWebToolName(name)):
             throw LocalAPIProtocolError.malformed(
                 "tool_choice references unknown function '\(name)'."
             )
@@ -1155,10 +1314,12 @@ struct LocalAPIReasoningDelta: Equatable, Sendable {
 
 struct LocalAPIReasoningFilter {
     private static let openingTags = [
-        "<think>", "<thinking>", "<reasoning>", "<|think|>", "<|thinking|>"
+        "<think>", "<thinking>", "<reasoning>", "<|think|>", "<|thinking|>",
+        "<|channel>thought\n", "<|channel>thought"
     ]
     private static let closingTags = [
-        "</think>", "</thinking>", "</reasoning>", "<|end_think|>", "<|end_thinking|>"
+        "</think>", "</thinking>", "</reasoning>", "<|end_think|>", "<|end_thinking|>",
+        "<channel|>"
     ]
     private static let implicitOpening = "Thinking Process:"
 
@@ -1504,7 +1665,7 @@ enum LocalAPIToolCalling {
 
         // `[` covers models that emit the tool calls as a JSON array of
         // objects; the balanced-brace scanner resolves the inner calls.
-        let toolPrefixes = ["{", "[", "<tool_call", "```json", "```"]
+        let toolPrefixes = ["{", "[", "<tool_call", "<|tool_call", "```json", "```"]
         let couldBeToolCall = toolPrefixes.contains {
             trimmed.hasPrefix($0) || $0.hasPrefix(trimmed)
         }
@@ -1518,7 +1679,8 @@ enum LocalAPIToolCalling {
         if decisionPrefix.count >= 64,
            !decisionPrefix.contains("\"tool_calls\""),
            !decisionPrefix.contains("\"name\""),
-           !decisionPrefix.contains("<tool_call") {
+           !decisionPrefix.contains("<tool_call"),
+           !decisionPrefix.contains("<|tool_call") {
             return false
         }
         return true
@@ -1585,12 +1747,40 @@ enum LocalAPIToolCalling {
             return result
         }
 
+        if parser == .gemma4 {
+            let declarations = tools.map { tool in
+                ChatTemplate.formatGemma4ToolDeclaration(
+                    name: tool.name,
+                    description: tool.description,
+                    parametersJSON: tool.parametersJSON
+                )
+            }.joined()
+            let gemmaInstruction = """
+            \(declarations)
+            \(choiceInstruction) \(countInstruction)
+            For a tool call, output <|tool_call>call:function_name{argument:<|"|>value<|"|>}<tool_call|>. For an ordinary answer, respond naturally without a tool-call wrapper.
+            """
+            var result = messages
+            if let systemIndex = result.firstIndex(where: { $0.role == .system }) {
+                var system = result[systemIndex]
+                system.content = system.content.isEmpty
+                    ? gemmaInstruction
+                    : system.content + "\n\n" + gemmaInstruction
+                result[systemIndex] = system
+            } else {
+                result.insert(ChatMessage(role: .system, content: gemmaInstruction), at: 0)
+            }
+            return result
+        }
+
         let responseInstruction: String
         switch parser {
         case .hermes:
             responseInstruction = "For a call, output <tool_call>{\"name\":\"function_name\",\"arguments\":{\"argument\":\"value\"}}</tool_call>. For an ordinary answer, respond naturally without a tool-call wrapper."
         case .qwen3XML, .qwen3Coder:
             responseInstruction = "For a call, output <tool_call><function=function_name><parameter=argument>value</parameter></function></tool_call>. For an ordinary answer, respond naturally without a tool-call wrapper."
+        case .gemma4:
+            responseInstruction = "For a call, output <|tool_call>call:function_name{argument:<|\"|>value<|\"|>}<tool_call|>. For an ordinary answer, respond naturally without a tool-call wrapper."
         case .foundationModels:
             // Core AI runs the text protocol: the runtime's native session
             // tools are not wired to the HTTP layer, so instruct the same
@@ -1642,7 +1832,7 @@ enum LocalAPIToolCalling {
         parser: ModelToolParser = .hermes
     ) -> MLXToolCallConstraintConfiguration? {
         guard !tools.isEmpty, choice != .none else { return nil }
-        guard parser != .qwen3XML, parser != .qwen3Coder else { return nil }
+        guard parser != .qwen3XML, parser != .qwen3Coder, parser != .gemma4 else { return nil }
 
         let names: [String]
         let decision: MLXToolCallConstraintConfiguration.Decision
@@ -1714,7 +1904,26 @@ enum LocalAPIToolCalling {
 
         // The registered parser is a prompt/template hint, not a guarantee
         // about what an imported fine-tune emits. Sniff the actual payload so
-        // a Hermes-registered Qwen3-Coder derivative still works.
+        // Gemma 4 (`<|tool_call>call:...`), Qwen3 XML, and Hermes JSON all work.
+        let gemma4Result = gemma4FunctionCalls(
+            in: cleanedOutput,
+            toolsByName: toolsByName,
+            validateSchemas: validateSchemas
+        )
+        if gemma4Result.foundEnvelope {
+            foundToolEnvelope = true
+            parsedCalls.append(contentsOf: gemma4Result.calls)
+            schemaRejectedCalls.append(contentsOf: gemma4Result.schemaRejectedCalls)
+            unavailableToolNames.append(contentsOf: gemma4Result.unavailableToolNames)
+            if parsedCalls.count >= callLimit {
+                return LocalAPIToolCallParseResult(
+                    calls: Array(parsedCalls.prefix(callLimit)),
+                    failure: nil,
+                    dialect: dialect
+                )
+            }
+        }
+
         let xmlResult = xmlFunctionCalls(
                 in: cleanedOutput,
                 toolsByName: toolsByName,
@@ -1827,12 +2036,13 @@ enum LocalAPIToolCalling {
         }
         if parsedCalls.isEmpty, foundToolEnvelope {
             let detectedDialect = dialect == "none" ? "unknown" : dialect
-            let rawPreview = String(output.prefix(200))
+            let safePreview = Self.redactSecretsForLog(String(output.prefix(200)))
+            let safeLogRaw = Self.redactSecretsForLog(String(output.prefix(600)))
             RuntimeLogCenter.emit(
                 "Tool call parsing failed · parser=\(parser.rawValue) · "
                     + "dialect=\(detectedDialect) · "
                     + "tools=\(tools.map(\.name).joined(separator: ",")) · "
-                    + "raw=\(output.prefix(600))",
+                    + "raw=\(safeLogRaw)",
                 level: .error,
                 subsystem: "api"
             )
@@ -1840,7 +2050,7 @@ enum LocalAPIToolCalling {
                 calls: [],
                 failure: .malformed(
                     dialect: detectedDialect,
-                    rawPreview: rawPreview
+                    rawPreview: safePreview
                 ),
                 dialect: detectedDialect
             )
@@ -1881,6 +2091,7 @@ enum LocalAPIToolCalling {
         let normalized = LocalAPIReasoningFilter.removingReasoning(from: output).lowercased()
         return normalized.contains("\"tool_calls\"")
             || normalized.contains("<tool_call")
+            || normalized.contains("<|tool_call")
             || (normalized.contains("\"name\"") && normalized.contains("\"arguments\""))
     }
 
@@ -1907,6 +2118,24 @@ enum LocalAPIToolCalling {
     private static func nonEmptyString(_ value: String?) -> String? {
         guard let value, !value.isEmpty else { return nil }
         return value
+    }
+
+    private static func redactSecretsForLog(_ input: String) -> String {
+        var cleaned = input
+        let patterns = [
+            #"\bodl_[A-Za-z0-9_\-]{8,}\b"#,
+            #"\bsk-[A-Za-z0-9_\-]{12,}\b"#,
+            #"(?i)\bbearer\s+[A-Za-z0-9._\-]{8,}"#,
+            #"(?i)\bx-api-key\s*[:=]\s*\S+"#
+        ]
+        for pattern in patterns {
+            cleaned = cleaned.replacingOccurrences(
+                of: pattern,
+                with: "[REDACTED_SECRET]",
+                options: .regularExpression
+            )
+        }
+        return cleaned
     }
 
     /// A single conservative repair pass for common streaming/quantization
@@ -2088,6 +2317,9 @@ enum LocalAPIToolCalling {
     }
 
     private static func detectedDialect(in output: String) -> String {
+        if output.range(of: "<|tool_call", options: [.caseInsensitive]) != nil {
+            return "gemma4"
+        }
         guard let opening = output.range(
             of: "<tool_call",
             options: [.caseInsensitive]
@@ -2104,6 +2336,332 @@ enum LocalAPIToolCalling {
         case "{": return "json"
         case "<": return "xml"
         default: return "unknown"
+        }
+    }
+
+    // MARK: - Gemma 4 Native Tool Call Parser (`<|tool_call>call:name{...}<tool_call|>`)
+
+    private struct Gemma4FunctionCallResult {
+        let calls: [LocalAPIToolCall]
+        let schemaRejectedCalls: [LocalAPIToolCall]
+        let unavailableToolNames: [String]
+        let foundEnvelope: Bool
+    }
+
+    private static func gemma4FunctionCalls(
+        in output: String,
+        toolsByName: [String: LocalAPIToolDefinition],
+        validateSchemas: Bool
+    ) -> Gemma4FunctionCallResult {
+        let openTag = "<|tool_call>"
+        let closeTag = "<tool_call|>"
+        guard output.contains("<|tool_call") else {
+            return Gemma4FunctionCallResult(
+                calls: [],
+                schemaRejectedCalls: [],
+                unavailableToolNames: [],
+                foundEnvelope: false
+            )
+        }
+
+        var calls: [LocalAPIToolCall] = []
+        var schemaRejected: [LocalAPIToolCall] = []
+        var unavailable: [String] = []
+        var cursor = output.startIndex
+
+        while let openRange = output.range(of: openTag, range: cursor..<output.endIndex) {
+            let bodyStart = openRange.upperBound
+            guard let closeRange = output.range(of: closeTag, range: bodyStart..<output.endIndex) else {
+                // Unclosed `<|tool_call>` — mark envelope found so parseResult reports malformed.
+                break
+            }
+            cursor = closeRange.upperBound
+            let rawInner = String(output[bodyStart..<closeRange.lowerBound])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+
+            var scanner = Gemma4ValueScanner(rawInner)
+            scanner.skipWhitespace()
+            if scanner.consumePrefix("call:") {
+                scanner.skipWhitespace()
+            }
+            guard let rawName = scanner.parseIdentifier(), !rawName.isEmpty else {
+                continue
+            }
+            scanner.skipWhitespace()
+
+            let parsedObject: [String: Any]
+            if scanner.isAtEnd {
+                parsedObject = [:]
+            } else if let obj = scanner.parseObject() {
+                scanner.skipWhitespace()
+                guard scanner.isAtEnd else { continue }
+                parsedObject = obj
+            } else {
+                continue
+            }
+
+            guard let tool = toolsByName[rawName] else {
+                unavailable.append(rawName)
+                continue
+            }
+            guard JSONSerialization.isValidJSONObject(parsedObject),
+                  let jsonData = try? JSONSerialization.data(
+                    withJSONObject: parsedObject,
+                    options: [.sortedKeys]
+                  ),
+                  let argumentsJSON = String(data: jsonData, encoding: .utf8) else {
+                continue
+            }
+
+            let call = LocalAPIToolCall(
+                id: "call_\(UUID().uuidString.replacingOccurrences(of: "-", with: ""))",
+                name: rawName,
+                argumentsJSON: argumentsJSON
+            )
+            if validateSchemas, !argumentsMatchSchema(argumentsJSON, schemaJSON: tool.parametersJSON) {
+                schemaRejected.append(call)
+            } else {
+                calls.append(call)
+            }
+        }
+
+        return Gemma4FunctionCallResult(
+            calls: calls,
+            schemaRejectedCalls: schemaRejected,
+            unavailableToolNames: unavailable,
+            foundEnvelope: true
+        )
+    }
+
+    private struct Gemma4ValueScanner {
+        private static let quoteDelim = Array("<|\"|>")
+        private let chars: [Character]
+        private var index: Int = 0
+
+        init(_ source: String) {
+            self.chars = Array(source)
+        }
+
+        var isAtEnd: Bool { index >= chars.count }
+
+        mutating func skipWhitespace() {
+            while index < chars.count, chars[index].isWhitespace {
+                index += 1
+            }
+        }
+
+        mutating func consumePrefix(_ prefix: String) -> Bool {
+            let p = Array(prefix)
+            guard index + p.count <= chars.count else { return false }
+            for offset in 0..<p.count where chars[index + offset] != p[offset] {
+                return false
+            }
+            index += p.count
+            return true
+        }
+
+        private func hasDelimiterAt(_ pos: Int) -> Bool {
+            let d = Self.quoteDelim
+            guard pos + d.count <= chars.count else { return false }
+            for i in 0..<d.count where chars[pos + i] != d[i] {
+                return false
+            }
+            return true
+        }
+
+        mutating func parseIdentifier() -> String? {
+            skipWhitespace()
+            if consumePrefix("<|\"|>") {
+                return readUntilGemmaQuoteClose()
+            }
+            if index < chars.count, chars[index] == "\"" {
+                return parseStandardQuotedString()
+            }
+            let start = index
+            while index < chars.count {
+                let c = chars[index]
+                if c.isLetter || c.isNumber || c == "_" || c == "-" || c == "." {
+                    index += 1
+                } else {
+                    break
+                }
+            }
+            guard index > start else { return nil }
+            return String(chars[start..<index])
+        }
+
+        mutating func parseObject() -> [String: Any]? {
+            skipWhitespace()
+            guard index < chars.count, chars[index] == "{" else { return nil }
+            index += 1
+            skipWhitespace()
+            var dict: [String: Any] = [:]
+            if index < chars.count, chars[index] == "}" {
+                index += 1
+                return dict
+            }
+            while index < chars.count {
+                guard let key = parseIdentifier() else { return nil }
+                skipWhitespace()
+                guard index < chars.count, chars[index] == ":" else { return nil }
+                index += 1
+                guard let val = parseValue() else { return nil }
+                dict[key] = val
+                skipWhitespace()
+                if index < chars.count, chars[index] == "," {
+                    index += 1
+                    skipWhitespace()
+                    if index < chars.count, chars[index] == "}" {
+                        index += 1
+                        return dict
+                    }
+                    continue
+                }
+                if index < chars.count, chars[index] == "}" {
+                    index += 1
+                    return dict
+                }
+                return nil
+            }
+            return nil
+        }
+
+        mutating func parseArray() -> [Any]? {
+            skipWhitespace()
+            guard index < chars.count, chars[index] == "[" else { return nil }
+            index += 1
+            skipWhitespace()
+            var arr: [Any] = []
+            if index < chars.count, chars[index] == "]" {
+                index += 1
+                return arr
+            }
+            while index < chars.count {
+                guard let val = parseValue() else { return nil }
+                arr.append(val)
+                skipWhitespace()
+                if index < chars.count, chars[index] == "," {
+                    index += 1
+                    skipWhitespace()
+                    if index < chars.count, chars[index] == "]" {
+                        index += 1
+                        return arr
+                    }
+                    continue
+                }
+                if index < chars.count, chars[index] == "]" {
+                    index += 1
+                    return arr
+                }
+                return nil
+            }
+            return nil
+        }
+
+        mutating func parseValue() -> Any? {
+            skipWhitespace()
+            guard index < chars.count else { return nil }
+            if consumePrefix("<|\"|>") {
+                return readUntilGemmaQuoteClose()
+            }
+            let c = chars[index]
+            if c == "\"" {
+                return parseStandardQuotedString()
+            }
+            if c == "{" {
+                return parseObject()
+            }
+            if c == "[" {
+                return parseArray()
+            }
+            if consumePrefix("true") && isBoundary() {
+                return true
+            }
+            if consumePrefix("false") && isBoundary() {
+                return false
+            }
+            if consumePrefix("null") && isBoundary() {
+                return NSNull()
+            }
+            return parseNumber()
+        }
+
+        private func isBoundary() -> Bool {
+            guard index < chars.count else { return true }
+            let c = chars[index]
+            return c.isWhitespace || c == "," || c == "}" || c == "]"
+        }
+
+        private mutating func readUntilGemmaQuoteClose() -> String? {
+            var out: [Character] = []
+            while index < chars.count {
+                if hasDelimiterAt(index) {
+                    index += Self.quoteDelim.count
+                    return String(out)
+                }
+                out.append(chars[index])
+                index += 1
+            }
+            return nil
+        }
+
+        private mutating func parseStandardQuotedString() -> String? {
+            guard index < chars.count, chars[index] == "\"" else { return nil }
+            index += 1
+            var out: [Character] = []
+            while index < chars.count {
+                let c = chars[index]
+                index += 1
+                if c == "\"" {
+                    return String(out)
+                }
+                if c == "\\", index < chars.count {
+                    let esc = chars[index]
+                    index += 1
+                    switch esc {
+                    case "\"": out.append("\"")
+                    case "\\": out.append("\\")
+                    case "/":  out.append("/")
+                    case "n":  out.append("\n")
+                    case "r":  out.append("\r")
+                    case "t":  out.append("\t")
+                    default:   out.append(esc)
+                    }
+                } else {
+                    out.append(c)
+                }
+            }
+            return nil
+        }
+
+        private mutating func parseNumber() -> Any? {
+            let start = index
+            if index < chars.count, (chars[index] == "-" || chars[index] == "+") {
+                index += 1
+            }
+            var hasDigits = false
+            var isFloat = false
+            while index < chars.count {
+                let c = chars[index]
+                if c.isNumber {
+                    hasDigits = true
+                    index += 1
+                } else if c == "." || c == "e" || c == "E" || c == "+" || c == "-" {
+                    if c == "." || c == "e" || c == "E" { isFloat = true }
+                    index += 1
+                } else {
+                    break
+                }
+            }
+            guard hasDigits else { return nil }
+            let token = String(chars[start..<index])
+            if !isFloat, let i = Int64(token) {
+                return NSNumber(value: i)
+            }
+            if let d = Double(token), d.isFinite {
+                return NSNumber(value: d)
+            }
+            return nil
         }
     }
 
@@ -2453,11 +3011,15 @@ enum LocalAPIResponse {
         toolCalls: [LocalAPIToolCall],
         reasoningContent: String = "",
         finishReason: String? = nil,
-        usage: LocalAPIUsage? = nil
+        usage: LocalAPIUsage? = nil,
+        citations: [WebSourceCitation] = []
     ) -> Data {
         var message: [String: Any] = ["role": "assistant"]
         if toolCalls.isEmpty {
             message["content"] = text
+            if !citations.isEmpty {
+                message["annotations"] = LocalAPIWebToolCoordinator.openAIAnnotations(citations)
+            }
         } else {
             message["content"] = NSNull()
             message["tool_calls"] = toolCalls.map { call in
@@ -2486,6 +3048,10 @@ enum LocalAPIResponse {
                     ?? (toolCalls.isEmpty ? "stop" : "tool_calls")
             ]]
         ]
+        if !citations.isEmpty, toolCalls.isEmpty {
+            payload["citations"] = citations.map { $0.url.absoluteString }
+            payload["web_sources"] = LocalAPIWebToolCoordinator.serializedCitations(citations)
+        }
         if let usage {
             payload["usage"] = usage.object
         }
@@ -2626,12 +3192,16 @@ enum LocalAPIResponse {
         toolCalls: [LocalAPIToolCall] = [],
         status: String = "completed",
         reasoningContent: String = "",
-        usage: LocalAPIUsage? = nil
+        usage: LocalAPIUsage? = nil,
+        citations: [WebSourceCitation] = []
     ) -> Data {
         let output: [[String: Any]]
         let outputText: String
         if toolCalls.isEmpty {
             outputText = text
+            let annotations = citations.isEmpty
+                ? []
+                : LocalAPIWebToolCoordinator.openAIAnnotations(citations)
             output = [[
                 "id": "msg_\(UUID().uuidString.replacingOccurrences(of: "-", with: ""))",
                 "type": "message",
@@ -2640,7 +3210,7 @@ enum LocalAPIResponse {
                 "content": [[
                     "type": "output_text",
                     "text": text,
-                    "annotations": []
+                    "annotations": annotations
                 ]]
             ]]
         } else {
@@ -2672,6 +3242,10 @@ enum LocalAPIResponse {
                 "total_tokens": 0
             ]
         ]
+        if !citations.isEmpty, toolCalls.isEmpty {
+            payload["citations"] = citations.map { $0.url.absoluteString }
+            payload["web_sources"] = LocalAPIWebToolCoordinator.serializedCitations(citations)
+        }
         if !reasoningContent.isEmpty {
             payload["reasoning_content"] = reasoningContent
         }
@@ -2694,6 +3268,152 @@ enum LocalAPIResponse {
     }
 }
 
+/// Deterministic multi-round server-side Web tool orchestrator shared by
+/// `LocalAPIServer` and offline `XCTest` suites.
+enum LocalAPIMultiRoundToolDriver {
+    struct Outcome: Sendable {
+        let finalText: String
+        let finalReasoning: String
+        let pendingClientCalls: [LocalAPIToolCall]
+        let citations: [WebSourceCitation]
+        let messages: [ChatMessage]
+        let executedRounds: Int
+        let parseResult: LocalAPIToolCallParseResult
+    }
+
+    static func makeAssistantAndToolMessages(
+        assistantProse: String,
+        calls: [LocalAPIToolCall],
+        results: [LocalAPIWebToolCoordinator.ToolExecutionResult]
+    ) -> [ChatMessage] {
+        let metadata = calls.map {
+            ChatMessage.ToolCallMetadata(
+                id: $0.id,
+                name: $0.name,
+                argumentsJSON: $0.argumentsJSON
+            )
+        }
+        let summaries = metadata.map {
+            "call_id=\($0.id) name=\($0.name) arguments=\($0.argumentsJSON)"
+        }
+        let assistantMsg = ChatMessage(
+            role: .assistant,
+            content: assistantProse,
+            modelContent: ([assistantProse].filter { !$0.isEmpty }
+                + ["[Previous tool calls]\n" + summaries.joined(separator: "\n")])
+                .joined(separator: "\n\n"),
+            toolCalls: metadata
+        )
+        let toolMsgs = results.map { res in
+            ChatMessage(
+                role: .tool,
+                content: res.contentJSON,
+                modelContent: "[Tool result for call_id=\(res.toolCallID)]\n\(res.contentJSON)",
+                toolCallID: res.toolCallID
+            )
+        }
+        return [assistantMsg] + toolMsgs
+    }
+
+    /// Runs up to `maxRounds` server-executed Web tool rounds (`web_search`,
+    /// `web_fetch`), returning early if the model emits a final text answer or
+    /// calls a client-owned tool.
+    static func run(
+        initialMessages: [ChatMessage],
+        tools: [LocalAPIToolDefinition],
+        initialChoice: LocalAPIToolChoice,
+        serverExecutedToolNames: Set<String>,
+        parser: ModelToolParser,
+        parallelLimit: Int,
+        validateSchemas: Bool,
+        prefilledReasoningOpen: Bool,
+        provider: WebSearchProvider = .freeAuto,
+        maxRounds: Int = LocalAPIWebToolCoordinator.maxAutoToolRounds,
+        coordinator: LocalAPIWebToolCoordinator = .shared,
+        generateRound: ([ChatMessage], [LocalAPIToolDefinition], LocalAPIToolChoice, Int) async throws -> String
+    ) async throws -> Outcome {
+        await coordinator.resetTurnBudget(maxNetworkOps: 12)
+        var workingMessages = initialMessages
+        var citations: [WebSourceCitation] = []
+        var visitedURLs = Set<String>()
+        var currentRound = 0
+
+        while true {
+            let allowToolsThisRound = !tools.isEmpty && currentRound < maxRounds
+            let activeTools = allowToolsThisRound ? tools : []
+            let activeChoice: LocalAPIToolChoice = allowToolsThisRound
+                ? (currentRound == 0 ? initialChoice : .auto)
+                : .none
+
+            let rawOutput = try await generateRound(
+                workingMessages,
+                activeTools,
+                activeChoice,
+                currentRound
+            )
+            let parsedReasoning = LocalAPIReasoningFilter.parse(
+                rawOutput,
+                prefilledOpening: prefilledReasoningOpen
+            )
+            let cleanedText = LocalAPIToolCalling.textResponse(from: rawOutput)
+                ?? parsedReasoning.content
+            let parsedCalls = allowToolsThisRound
+                ? LocalAPIToolCalling.parseResult(
+                    rawOutput,
+                    tools: activeTools,
+                    parallelToolCalls: parallelLimit > 1,
+                    validateSchemas: validateSchemas,
+                    parser: parser,
+                    maximumCalls: parallelLimit
+                )
+                : LocalAPIToolCallParseResult(calls: [], failure: nil, dialect: "none")
+
+            let calls = parsedCalls.calls
+            if !calls.isEmpty,
+               !serverExecutedToolNames.isEmpty,
+               calls.allSatisfy({ serverExecutedToolNames.contains($0.name) }),
+               currentRound < maxRounds {
+                var results: [LocalAPIWebToolCoordinator.ToolExecutionResult] = []
+                for call in calls {
+                    let result = await coordinator.executeToolCall(
+                        id: call.id,
+                        name: call.name,
+                        argumentsJSON: call.argumentsJSON,
+                        provider: provider,
+                        nextCitationIndex: citations.count + 1,
+                        visitedURLs: &visitedURLs
+                    )
+                    citations.append(contentsOf: result.citations)
+                    results.append(result)
+                }
+                workingMessages.append(contentsOf: makeAssistantAndToolMessages(
+                    assistantProse: cleanedText,
+                    calls: calls,
+                    results: results
+                ))
+                currentRound += 1
+                continue
+            }
+
+            let finalRendered = calls.isEmpty
+                ? LocalAPIWebToolCoordinator.ensureCitationsRendered(
+                    in: cleanedText,
+                    citations: citations
+                ).fullText
+                : cleanedText
+            return Outcome(
+                finalText: finalRendered,
+                finalReasoning: parsedReasoning.reasoning,
+                pendingClientCalls: calls,
+                citations: citations,
+                messages: workingMessages,
+                executedRounds: currentRound,
+                parseResult: parsedCalls
+            )
+        }
+    }
+}
+
 actor LocalAPIServer {
     enum Event: Sendable {
         case ready
@@ -2710,7 +3430,7 @@ actor LocalAPIServer {
     private var listenerID: UUID?
     private struct ActiveInference {
         let id: UUID
-        let signal: LocalAPIInferenceSignal
+        var signal: LocalAPIInferenceSignal
         let connection: NWConnection
         var timedOut = false
     }
@@ -2956,6 +3676,10 @@ actor LocalAPIServer {
             await listOpenAIModels(connection)
         case ("GET", "/v1/aider/config"):
             await aiderConfiguration(connection)
+        case ("POST", "/v1/web/search"):
+            await handleDirectWebSearch(request, connection: connection)
+        case ("POST", "/v1/web/fetch"):
+            await handleDirectWebFetch(request, connection: connection)
         case ("POST", "/v1/chat/completions"):
             await run(
                 request,
@@ -3115,15 +3839,34 @@ actor LocalAPIServer {
             )
             return
         }
-        let toolCallingEnabled = (
+        let webSettings = await MainActor.run {
+            let s = AppSettings.shared
+            return (
+                enabled: s.localAPIWebSearchEnabled,
+                provider: WebSearchProvider(rawValue: s.localAPIWebSearchProvider) ?? .freeAuto
+            )
+        }
+        let supportsToolsDialect = (
             dialect == .openAIChat
                 || dialect == .openAIResponses
                 || dialect == .anthropic
                 || dialect == .ollamaChat
         )
+        let webToolResolution = LocalAPIWebToolResolution.resolve(
+            requestTools: decoded.tools,
+            requestChoice: decoded.toolChoice,
+            explicitChoiceProvided: decoded.explicitToolChoice,
+            webSearchMode: supportsToolsDialect ? decoded.webSearchMode : .disabled,
+            globalWebSearchEnabled: webSettings.enabled,
+            globalToolCallingEnabled: snapshot.3 && supportsToolsDialect
+        )
+        let effectiveTools = webToolResolution.effectiveTools
+        let effectiveToolChoice = webToolResolution.effectiveChoice
+        let serverExecutedToolNames = webToolResolution.serverExecutedToolNames
+        let toolCallingEnabled = supportsToolsDialect
             && snapshot.3
-            && !decoded.tools.isEmpty
-            && decoded.toolChoice != .none
+            && !effectiveTools.isEmpty
+            && effectiveToolChoice != .none
         let configuredParallelLimit = await MainActor.run {
             LocalAPIParallelToolCallsSetting(
                 rawValue: AppSettings.shared.localAPIParallelToolCallsLimit
@@ -3144,8 +3887,8 @@ actor LocalAPIServer {
         let countMessages: LocalAPIHistorySelector.TokenCounter = { messages in
             let prepared = LocalAPIToolCalling.messages(
                 from: messages,
-                tools: toolCallingEnabled ? decoded.tools : [],
-                choice: toolCallingEnabled ? decoded.toolChoice : .none,
+                tools: toolCallingEnabled ? effectiveTools : [],
+                choice: toolCallingEnabled ? effectiveToolChoice : .none,
                 parallelToolCalls: parallelLimit > 1,
                 parser: snapshot.7.toolParser,
                 nativeTemplate: usesNativeToolTemplate
@@ -3309,23 +4052,23 @@ actor LocalAPIServer {
         let topP = decoded.topP.map { min(max(0, $0), 1) }
         let inferenceMessages = LocalAPIToolCalling.messages(
             from: history.messages,
-            tools: toolCallingEnabled ? decoded.tools : [],
-            choice: toolCallingEnabled ? decoded.toolChoice : .none,
+            tools: toolCallingEnabled ? effectiveTools : [],
+            choice: toolCallingEnabled ? effectiveToolChoice : .none,
             parallelToolCalls: parallelLimit > 1,
             parser: snapshot.7.toolParser,
             nativeTemplate: usesNativeToolTemplate
         )
         let legacyToolConstraint = toolCallingEnabled && !usesNativeToolTemplate
             ? LocalAPIToolCalling.nativeConstraintConfiguration(
-                tools: decoded.tools,
-                choice: decoded.toolChoice,
+                tools: effectiveTools,
+                choice: effectiveToolChoice,
                 parallelToolCalls: parallelLimit > 1,
                 reasoningEnabled: !forceNoThinking,
                 parser: snapshot.7.toolParser
             )
             : nil
         let nativeTools = usesNativeToolTemplate
-            ? decoded.tools.map {
+            ? effectiveTools.map {
                 AssistantNativeToolDefinition(
                     name: $0.name,
                     description: $0.description,
@@ -3336,11 +4079,66 @@ actor LocalAPIServer {
         let nativeToolFormat: AssistantNativeToolFormat? = switch snapshot.7.toolParser {
         case .hermes: .hermesJSON
         case .qwen3XML, .qwen3Coder: .qwenXML
-        // Foundation Models performs tool selection through its own runtime;
-        // it does not use the MLX chat-template format adapter.
-        case .foundationModels: nil
-        case .none: nil
+        // Gemma 4 and Foundation Models format tool schemas via `LocalAPIToolCalling.messages`
+        // or their own runtime rather than the MLX Jinja dictionary adapter.
+        case .gemma4, .foundationModels, .none: nil
         }
+        func startRoundStream(
+            messages: [ChatMessage],
+            roundTools: [LocalAPIToolDefinition],
+            roundChoice: LocalAPIToolChoice
+        ) async -> (AsyncStream<String>, LocalAPIInferenceSignal) {
+            _ = await CodingAssistantService.shared.waitForGenerationToFinish(
+                timeout: .seconds(5)
+            )
+            let roundUsesTools = toolCallingEnabled && !roundTools.isEmpty && roundChoice != .none
+            let roundUsesNative = roundUsesTools && usesNativeToolTemplate
+            let roundMessages = LocalAPIToolCalling.messages(
+                from: messages,
+                tools: roundUsesTools ? roundTools : [],
+                choice: roundUsesTools ? roundChoice : .none,
+                parallelToolCalls: parallelLimit > 1,
+                parser: snapshot.7.toolParser,
+                nativeTemplate: roundUsesNative
+            )
+            let roundConstraint = roundUsesTools && !roundUsesNative
+                ? LocalAPIToolCalling.nativeConstraintConfiguration(
+                    tools: roundTools,
+                    choice: roundChoice,
+                    parallelToolCalls: parallelLimit > 1,
+                    reasoningEnabled: !forceNoThinking,
+                    parser: snapshot.7.toolParser
+                )
+                : nil
+            let roundNativeTools = roundUsesNative
+                ? roundTools.map {
+                    AssistantNativeToolDefinition(
+                        name: $0.name,
+                        description: $0.description,
+                        parametersJSON: $0.parametersJSON
+                    )
+                }
+                : []
+            let roundTemp = roundUsesTools ? 0 : requestedTemperature
+            let nextSignal = LocalAPIInferenceSignal()
+            if activeInference?.id == inferenceID {
+                activeInference?.signal = nextSignal
+            }
+            let nextStream = await inferenceStream(
+                messages: roundMessages,
+                maxTokens: maxTokens,
+                temperature: roundTemp,
+                topP: topP,
+                jsonMode: false,
+                forceNoThinking: forceNoThinking,
+                toolConstraint: roundConstraint,
+                nativeTools: roundNativeTools,
+                nativeToolFormat: roundUsesNative ? nativeToolFormat : nil,
+                signal: nextSignal
+            )
+            return (nextStream, nextSignal)
+        }
+
         let stream = await inferenceStream(
             messages: inferenceMessages,
             maxTokens: maxTokens,
@@ -3381,6 +4179,15 @@ actor LocalAPIServer {
                 var toolStartedAssistantRole = false
                 var toolStartedVisibleContent = false
                 var streamsAsText = false
+                var workingMessages = history.messages
+                var webCitations: [WebSourceCitation] = []
+                var visitedWebURLs = Set<String>()
+                var webRound = 0
+                var currentStream = stream
+                var currentSignal = inferenceSignal
+                if !serverExecutedToolNames.isEmpty {
+                    await LocalAPIWebToolCoordinator.shared.resetTurnBudget(maxNetworkOps: 12)
+                }
 
                 // Actor-isolated: concurrent heartbeat / delta / finisher
                 // callers serialize here and cannot double-write headers.
@@ -3535,6 +4342,20 @@ actor LocalAPIServer {
                     await ensureToolHeaders()
                     do {
                         try await emitToolTextDelta(toolReasoningFilter.finish())
+                        if !webCitations.isEmpty {
+                            let rendered = LocalAPIWebToolCoordinator.ensureCitationsRendered(
+                                in: streamedText,
+                                citations: webCitations
+                            )
+                            if !rendered.appendedSuffix.isEmpty {
+                                try await emitToolTextDelta(
+                                    LocalAPIReasoningDelta(
+                                        reasoning: "",
+                                        content: rendered.appendedSuffix
+                                    )
+                                )
+                            }
+                        }
                     } catch {
                         await cancelInference()
                         connection.cancel()
@@ -3561,6 +4382,9 @@ actor LocalAPIServer {
                         connection.cancel()
                         return
                     }
+                    let streamAnnotations = webCitations.isEmpty
+                        ? []
+                        : LocalAPIWebToolCoordinator.openAIAnnotations(webCitations)
                     switch dialect {
                     case .openAIChat:
                         try? await sendFinal(
@@ -3568,10 +4392,10 @@ actor LocalAPIServer {
                             LocalAPIResponse.openAIStreamTerminator(
                                 id: requestID,
                                 model: snapshot.0,
-                                finishReason: inferenceSignal.result?.stopReason == .length
+                                finishReason: currentSignal.result?.stopReason == .length
                                     ? "length"
                                     : "stop",
-                                usage: inferenceSignal.result.map(LocalAPIUsage.init),
+                                usage: currentSignal.result.map(LocalAPIUsage.init),
                                 includeUsage: decoded.streamIncludeUsage
                             )
                         )
@@ -3596,7 +4420,7 @@ actor LocalAPIServer {
                                 "part": [
                                     "type": "output_text",
                                     "text": streamedText,
-                                    "annotations": []
+                                    "annotations": streamAnnotations
                                 ] as [String: Any]
                             ]
                         ))
@@ -3613,7 +4437,7 @@ actor LocalAPIServer {
                                     "content": [[
                                         "type": "output_text",
                                         "text": streamedText,
-                                        "annotations": []
+                                        "annotations": streamAnnotations
                                     ]] as [[String: Any]]
                                 ] as [String: Any]
                             ]
@@ -3627,13 +4451,14 @@ actor LocalAPIServer {
                                         model: snapshot.0,
                                         text: streamedText,
                                         reasoningContent: toolReasoningFilter.reasoningText,
-                                        usage: inferenceSignal.result.map(LocalAPIUsage.init)
+                                        usage: currentSignal.result.map(LocalAPIUsage.init),
+                                        citations: webCitations
                                     )
                                 )) ?? [:]
                             ]
                         ))
                     case .anthropic:
-                        let streamUsage = inferenceSignal.result.map(LocalAPIUsage.init)
+                        let streamUsage = currentSignal.result.map(LocalAPIUsage.init)
                         try? await send(connection, LocalAPIResponse.anthropicEvent(
                             "content_block_stop",
                             object: ["type": "content_block_stop", "index": 0]
@@ -3681,119 +4506,189 @@ actor LocalAPIServer {
                     connection.cancel()
                 }
 
-                var decisionFilter = LocalAPIReasoningFilter(
-                    prefilledOpening: prefilledReasoningOpen
-                )
-                var decisionContent = ""
                 do {
-                    for await token in stream {
+                    while true {
+                        let roundAllowsTools = webRound < LocalAPIWebToolCoordinator.maxAutoToolRounds
+                        let roundTools = roundAllowsTools ? effectiveTools : []
+                        let roundChoice: LocalAPIToolChoice = roundAllowsTools
+                            ? (webRound == 0 ? effectiveToolChoice : .auto)
+                            : .none
+                        output.removeAll(keepingCapacity: true)
+                        toolReasoningFilter = LocalAPIReasoningFilter(
+                            prefilledOpening: prefilledReasoningOpen
+                        )
+                        var decisionFilter = LocalAPIReasoningFilter(
+                            prefilledOpening: prefilledReasoningOpen
+                        )
+                        var decisionContent = ""
+                        streamsAsText = !roundAllowsTools
+
+                        for await token in currentStream {
+                            if streamsAsText {
+                                try await emitToolTextDelta(toolReasoningFilter.consume(token))
+                                continue
+                            }
+                            output += token
+                            // Decide on the post-reasoning view of the stream.
+                            // A thinking model can open with a long <think> block
+                            // and still end in a tool call — the raw prefix says
+                            // "prose", but the tool envelope behind the reasoning
+                            // must stay buffered, not stream as visible text.
+                            let visibleDelta = decisionFilter.consume(token)
+                            decisionContent += visibleDelta.content
+                            if !LocalAPIToolCalling.shouldBufferForToolDecision(decisionContent) {
+                                streamsAsText = true
+                                try await emitToolTextDelta(
+                                    toolReasoningFilter.consume(output)
+                                )
+                                output.removeAll(keepingCapacity: true)
+                            }
+                            if output.count > 100_000 {
+                                await cancelInference()
+                                break
+                            }
+                        }
                         if streamsAsText {
-                            try await emitToolTextDelta(toolReasoningFilter.consume(token))
+                            await finishToolTextStream()
+                            return
+                        }
+                        let parsedToolCalls = LocalAPIToolCalling.parseResult(
+                            output,
+                            tools: roundTools,
+                            parallelToolCalls: parallelLimit > 1,
+                            validateSchemas: snapshot.6,
+                            parser: snapshot.7.toolParser,
+                            maximumCalls: parallelLimit
+                        )
+                        let calls = parsedToolCalls.calls
+                        let parsedOutput = LocalAPIReasoningFilter.parse(
+                            output,
+                            prefilledOpening: prefilledReasoningOpen
+                        )
+                        let cleanedOutput = LocalAPIToolCalling.textResponse(from: output)
+                            ?? parsedOutput.content
+                        if calls.isEmpty {
+                            let requiredTool = roundChoice != .auto && roundChoice != .none
+                            let invalidEnvelope = LocalAPIToolCalling.containsToolCallEnvelope(output)
+                            let timedOut = activeInference?.id == inferenceID
+                                && activeInference?.timedOut == true
+                            if requiredTool || invalidEnvelope || timedOut || parsedToolCalls.failure != nil {
+                                let failureMessage = timedOut
+                                    ? LocalAPIInferencePolicy.toolTimeoutMessage
+                                    : LocalAPIToolCalling.toolCallErrorMessage(
+                                        for: parsedToolCalls,
+                                        tools: roundTools
+                                    )
+                                if hasCommittedStreamingHeaders(connection) {
+                                    try? await sendStreamingErrorEvent(
+                                        connection,
+                                        dialect: dialect,
+                                        type: timedOut ? "generation_timeout" : "tool_call_error",
+                                        message: failureMessage
+                                    )
+                                } else {
+                                    await error(
+                                        connection,
+                                        status: 502,
+                                        message: failureMessage,
+                                        dialect: dialect
+                                    )
+                                }
+                                return
+                            }
+                            guard LocalAPIAssistantOutputValidator.hasAnswer(
+                                text: cleanedOutput,
+                                toolCalls: calls
+                            ) else {
+                                RuntimeLogCenter.emit(
+                                    "Model returned no assistant answer · model=\(snapshot.0)",
+                                    level: .error,
+                                    subsystem: "api"
+                                )
+                                if hasCommittedStreamingHeaders(connection) {
+                                    try? await sendStreamingModelError(
+                                        connection,
+                                        dialect: dialect
+                                    )
+                                } else {
+                                    await error(
+                                        connection,
+                                        status: 502,
+                                        message: LocalAPIAssistantOutputValidator.noAnswerMessage,
+                                        dialect: dialect
+                                    )
+                                }
+                                return
+                            }
+                            try await emitToolTextDelta(LocalAPIReasoningDelta(
+                                reasoning: parsedOutput.reasoning,
+                                content: cleanedOutput
+                            ))
+                            await finishToolTextStream()
+                            return
+                        }
+
+                        // Execute built-in server Web tools (`web_search`, `web_fetch`)
+                        // across up to `maxAutoToolRounds` before streaming the final
+                        // grounded answer; forward client-owned custom tools immediately.
+                        if !serverExecutedToolNames.isEmpty,
+                           calls.allSatisfy({ serverExecutedToolNames.contains($0.name) }),
+                           webRound < LocalAPIWebToolCoordinator.maxAutoToolRounds {
+                            if dialect.usesServerSentEvents {
+                                await ensureToolHeaders()
+                                try? await send(
+                                    connection,
+                                    Data(": web_tool_round=\(webRound + 1) tools=\(calls.map(\.name).joined(separator: ","))\n\n".utf8)
+                                )
+                            }
+                            var results: [LocalAPIWebToolCoordinator.ToolExecutionResult] = []
+                            for call in calls {
+                                let res = await LocalAPIWebToolCoordinator.shared.executeToolCall(
+                                    id: call.id,
+                                    name: call.name,
+                                    argumentsJSON: call.argumentsJSON,
+                                    provider: webSettings.provider,
+                                    nextCitationIndex: webCitations.count + 1,
+                                    visitedURLs: &visitedWebURLs
+                                )
+                                webCitations.append(contentsOf: res.citations)
+                                results.append(res)
+                            }
+                            workingMessages.append(contentsOf: LocalAPIMultiRoundToolDriver.makeAssistantAndToolMessages(
+                                assistantProse: cleanedOutput,
+                                calls: calls,
+                                results: results
+                            ))
+                            webRound += 1
+                            let nextAllowsTools = webRound < LocalAPIWebToolCoordinator.maxAutoToolRounds
+                            let nextTools = nextAllowsTools ? effectiveTools : []
+                            let nextChoice: LocalAPIToolChoice = nextAllowsTools ? .auto : .none
+                            let roundCounter: LocalAPIHistorySelector.TokenCounter = { msgs in
+                                let prepared = LocalAPIToolCalling.messages(
+                                    from: msgs,
+                                    tools: nextTools,
+                                    choice: nextChoice,
+                                    parallelToolCalls: parallelLimit > 1,
+                                    parser: snapshot.7.toolParser,
+                                    nativeTemplate: nextAllowsTools && usesNativeToolTemplate
+                                )
+                                return conservativeCounter.count(messages: prepared)
+                            }
+                            if let selected = try? await LocalAPIHistorySelector.select(
+                                messages: workingMessages,
+                                promptBudget: promptBudget,
+                                counter: roundCounter
+                            ) {
+                                workingMessages = selected.messages
+                            }
+                            (currentStream, currentSignal) = await startRoundStream(
+                                messages: workingMessages,
+                                roundTools: nextTools,
+                                roundChoice: nextChoice
+                            )
                             continue
                         }
-                        output += token
-                        // Decide on the post-reasoning view of the stream.
-                        // A thinking model can open with a long <think> block
-                        // and still end in a tool call — the raw prefix says
-                        // "prose", but the tool envelope behind the reasoning
-                        // must stay buffered, not stream as visible text.
-                        let visibleDelta = decisionFilter.consume(token)
-                        decisionContent += visibleDelta.content
-                        if !LocalAPIToolCalling.shouldBufferForToolDecision(decisionContent) {
-                            streamsAsText = true
-                            try await emitToolTextDelta(
-                                toolReasoningFilter.consume(output)
-                            )
-                            output.removeAll(keepingCapacity: true)
-                        }
-                        if output.count > 100_000 {
-                            await cancelInference()
-                            break
-                        }
-                    }
-                    if streamsAsText {
-                        await finishToolTextStream()
-                        return
-                    }
-                    let parsedToolCalls = LocalAPIToolCalling.parseResult(
-                        output,
-                        tools: decoded.tools,
-                        parallelToolCalls: parallelLimit > 1,
-                        validateSchemas: snapshot.6,
-                        parser: snapshot.7.toolParser,
-                        maximumCalls: parallelLimit
-                    )
-                    let calls = parsedToolCalls.calls
-                    let parsedOutput = LocalAPIReasoningFilter.parse(
-                        output,
-                        prefilledOpening: prefilledReasoningOpen
-                    )
-                    let cleanedOutput = LocalAPIToolCalling.textResponse(from: output)
-                        ?? parsedOutput.content
-                    if calls.isEmpty {
-                        let requiredTool = decoded.toolChoice != .auto
-                        let invalidEnvelope = LocalAPIToolCalling.containsToolCallEnvelope(output)
-                        let timedOut = activeInference?.id == inferenceID
-                            && activeInference?.timedOut == true
-                        if requiredTool || invalidEnvelope || timedOut || parsedToolCalls.failure != nil {
-                            // A fast tool decision stays silent, so the
-                            // failure can still carry a real HTTP status —
-                            // the same 502 the non-streaming path returns.
-                            // Once the heartbeat has committed to a 200, the
-                            // error rides the stream instead.
-                            let failureMessage = timedOut
-                                ? LocalAPIInferencePolicy.toolTimeoutMessage
-                                : LocalAPIToolCalling.toolCallErrorMessage(
-                                    for: parsedToolCalls,
-                                    tools: decoded.tools
-                                )
-                            if hasCommittedStreamingHeaders(connection) {
-                                try? await sendStreamingErrorEvent(
-                                    connection,
-                                    dialect: dialect,
-                                    type: timedOut ? "generation_timeout" : "tool_call_error",
-                                    message: failureMessage
-                                )
-                            } else {
-                                await error(
-                                    connection,
-                                    status: 502,
-                                    message: failureMessage,
-                                    dialect: dialect
-                                )
-                            }
-                            return
-                        }
-                        guard LocalAPIAssistantOutputValidator.hasAnswer(
-                            text: cleanedOutput,
-                            toolCalls: calls
-                        ) else {
-                            RuntimeLogCenter.emit(
-                                "Model returned no assistant answer · model=\(snapshot.0)",
-                                level: .error,
-                                subsystem: "api"
-                            )
-                            if hasCommittedStreamingHeaders(connection) {
-                                try? await sendStreamingModelError(
-                                    connection,
-                                    dialect: dialect
-                                )
-                            } else {
-                                await error(
-                                    connection,
-                                    status: 502,
-                                    message: LocalAPIAssistantOutputValidator.noAnswerMessage,
-                                    dialect: dialect
-                                )
-                            }
-                            return
-                        }
-                        try await emitToolTextDelta(LocalAPIReasoningDelta(
-                            reasoning: parsedOutput.reasoning,
-                            content: cleanedOutput
-                        ))
-                        await finishToolTextStream()
-                    } else {
+
                         await ensureToolHeaders()
                         switch dialect {
                         case .openAIChat:
@@ -3835,7 +4730,7 @@ actor LocalAPIServer {
                                     id: requestID,
                                     model: snapshot.0,
                                     finishReason: "tool_calls",
-                                    usage: inferenceSignal.result.map(LocalAPIUsage.init),
+                                    usage: currentSignal.result.map(LocalAPIUsage.init),
                                     includeUsage: decoded.streamIncludeUsage
                                 )
                             )
@@ -3843,7 +4738,7 @@ actor LocalAPIServer {
                             try await sendAnthropicToolCompletion(
                                 connection,
                                 calls: calls,
-                                usage: inferenceSignal.result.map(LocalAPIUsage.init),
+                                usage: currentSignal.result.map(LocalAPIUsage.init),
                                 inputTokens: budgetDecision.effectivePrompt.tokens
                             )
                         case .openAIResponses:
@@ -3864,9 +4759,6 @@ actor LocalAPIServer {
                                     + Data("\n".utf8)
                             )
                         case .ollamaGenerate:
-                            // Tool calling is not enabled for this dialect
-                            // today; keep the NDJSON stream terminated if it
-                            // ever is.
                             try? await sendFinal(
                                 connection,
                                 LocalAPIResponse.ollamaGenerate(
@@ -3876,6 +4768,7 @@ actor LocalAPIServer {
                                 ) + Data("\n".utf8)
                             )
                         }
+                        break
                     }
                 } catch {
                     await cancelInference()
@@ -4161,28 +5054,115 @@ actor LocalAPIServer {
             }
             connection.cancel()
         } else {
+            var workingMessages = history.messages
+            var webCitations: [WebSourceCitation] = []
+            var visitedWebURLs = Set<String>()
+            var webRound = 0
+            var currentStream = stream
+            var currentSignal = inferenceSignal
+            if !serverExecutedToolNames.isEmpty {
+                await LocalAPIWebToolCoordinator.shared.resetTurnBudget(maxNetworkOps: 12)
+            }
+
             var output = ""
             output.reserveCapacity(min(maxTokens * 4, 256 * 1_024))
-            for await token in stream {
-                output += token
-            }
-            let parsedOutput = LocalAPIReasoningFilter.parse(
-                output,
-                prefilledOpening: prefilledReasoningOpen
-            )
-            let cleanedOutput = LocalAPIToolCalling.textResponse(from: output)
-                ?? parsedOutput.content
-            let parsedToolCalls = toolCallingEnabled
-                ? LocalAPIToolCalling.parseResult(
+            var parsedOutput = LocalAPIReasoningDelta(reasoning: "", content: "")
+            var cleanedOutput = ""
+            var parsedToolCalls = LocalAPIToolCallParseResult(calls: [], failure: nil, dialect: "none")
+            var detectedCalls: [LocalAPIToolCall] = []
+            var roundTools = effectiveTools
+            var roundChoice = effectiveToolChoice
+
+            while true {
+                let roundAllowsTools = toolCallingEnabled && webRound < LocalAPIWebToolCoordinator.maxAutoToolRounds
+                roundTools = roundAllowsTools ? effectiveTools : []
+                roundChoice = roundAllowsTools
+                    ? (webRound == 0 ? effectiveToolChoice : .auto)
+                    : .none
+
+                output.removeAll(keepingCapacity: true)
+                for await token in currentStream {
+                    output += token
+                }
+                parsedOutput = LocalAPIReasoningFilter.parse(
                     output,
-                    tools: decoded.tools,
-                    parallelToolCalls: parallelLimit > 1,
-                    validateSchemas: snapshot.6,
-                    parser: snapshot.7.toolParser,
-                    maximumCalls: parallelLimit
+                    prefilledOpening: prefilledReasoningOpen
                 )
-                : LocalAPIToolCallParseResult(calls: [], failure: nil, dialect: "none")
-            let detectedCalls = parsedToolCalls.calls
+                cleanedOutput = LocalAPIToolCalling.textResponse(from: output)
+                    ?? parsedOutput.content
+                parsedToolCalls = roundAllowsTools
+                    ? LocalAPIToolCalling.parseResult(
+                        output,
+                        tools: roundTools,
+                        parallelToolCalls: parallelLimit > 1,
+                        validateSchemas: snapshot.6,
+                        parser: snapshot.7.toolParser,
+                        maximumCalls: parallelLimit
+                    )
+                    : LocalAPIToolCallParseResult(calls: [], failure: nil, dialect: "none")
+                detectedCalls = parsedToolCalls.calls
+
+                if !detectedCalls.isEmpty,
+                   !serverExecutedToolNames.isEmpty,
+                   detectedCalls.allSatisfy({ serverExecutedToolNames.contains($0.name) }),
+                   webRound < LocalAPIWebToolCoordinator.maxAutoToolRounds {
+                    var results: [LocalAPIWebToolCoordinator.ToolExecutionResult] = []
+                    for call in detectedCalls {
+                        let res = await LocalAPIWebToolCoordinator.shared.executeToolCall(
+                            id: call.id,
+                            name: call.name,
+                            argumentsJSON: call.argumentsJSON,
+                            provider: webSettings.provider,
+                            nextCitationIndex: webCitations.count + 1,
+                            visitedURLs: &visitedWebURLs
+                        )
+                        webCitations.append(contentsOf: res.citations)
+                        results.append(res)
+                    }
+                    workingMessages.append(contentsOf: LocalAPIMultiRoundToolDriver.makeAssistantAndToolMessages(
+                        assistantProse: cleanedOutput,
+                        calls: detectedCalls,
+                        results: results
+                    ))
+                    webRound += 1
+                    let nextAllowsTools = webRound < LocalAPIWebToolCoordinator.maxAutoToolRounds
+                    let nextTools = nextAllowsTools ? effectiveTools : []
+                    let nextChoice: LocalAPIToolChoice = nextAllowsTools ? .auto : .none
+                    let roundCounter: LocalAPIHistorySelector.TokenCounter = { msgs in
+                        let prepared = LocalAPIToolCalling.messages(
+                            from: msgs,
+                            tools: nextTools,
+                            choice: nextChoice,
+                            parallelToolCalls: parallelLimit > 1,
+                            parser: snapshot.7.toolParser,
+                            nativeTemplate: nextAllowsTools && usesNativeToolTemplate
+                        )
+                        return conservativeCounter.count(messages: prepared)
+                    }
+                    if let selected = try? await LocalAPIHistorySelector.select(
+                        messages: workingMessages,
+                        promptBudget: promptBudget,
+                        counter: roundCounter
+                    ) {
+                        workingMessages = selected.messages
+                    }
+                    (currentStream, currentSignal) = await startRoundStream(
+                        messages: workingMessages,
+                        roundTools: nextTools,
+                        roundChoice: nextChoice
+                    )
+                    continue
+                }
+                break
+            }
+
+            if detectedCalls.isEmpty, !webCitations.isEmpty {
+                cleanedOutput = LocalAPIWebToolCoordinator.ensureCitationsRendered(
+                    in: cleanedOutput,
+                    citations: webCitations
+                ).fullText
+            }
+
             let timedOut = activeInference?.id == inferenceID
                 && activeInference?.timedOut == true
             if timedOut, !toolCallingEnabled {
@@ -4197,7 +5177,7 @@ actor LocalAPIServer {
             let invalidToolResponse = toolCallingEnabled
                 && detectedCalls.isEmpty
                 && (
-                    decoded.toolChoice != .auto
+                    (roundChoice != .auto && roundChoice != .none)
                         || LocalAPIToolCalling.containsToolCallEnvelope(output)
                         || parsedToolCalls.failure != nil
                         || timedOut
@@ -4210,7 +5190,7 @@ actor LocalAPIServer {
                         ? LocalAPIInferencePolicy.toolTimeoutMessage
                         : LocalAPIToolCalling.toolCallErrorMessage(
                             for: parsedToolCalls,
-                            tools: decoded.tools
+                            tools: roundTools
                         ),
                     dialect: dialect
                 )
@@ -4234,10 +5214,10 @@ actor LocalAPIServer {
                 return
             }
             let payload: Data
-            let generationUsage = inferenceSignal.result.map(LocalAPIUsage.init)
+            let generationUsage = currentSignal.result.map(LocalAPIUsage.init)
             switch dialect {
             case .openAIChat:
-                let generationResult = inferenceSignal.result
+                let generationResult = currentSignal.result
                 payload = LocalAPIResponse.openAIChatCompletion(
                     id: "chatcmpl-\(UUID().uuidString)",
                     model: snapshot.0,
@@ -4247,7 +5227,8 @@ actor LocalAPIServer {
                     finishReason: detectedCalls.isEmpty
                         ? (generationResult?.stopReason == .length ? "length" : "stop")
                         : "tool_calls",
-                    usage: generationResult.map(LocalAPIUsage.init)
+                    usage: generationResult.map(LocalAPIUsage.init),
+                    citations: webCitations
                 )
             case .openAIResponses:
                 payload = LocalAPIResponse.openAIResponse(
@@ -4256,7 +5237,8 @@ actor LocalAPIServer {
                     text: cleanedOutput,
                     toolCalls: detectedCalls,
                     reasoningContent: parsedOutput.reasoning,
-                    usage: generationUsage
+                    usage: generationUsage,
+                    citations: webCitations
                 )
             case .anthropic:
                 payload = detectedCalls.isEmpty
@@ -4530,12 +5512,16 @@ actor LocalAPIServer {
     }
 
     private func describeAPI(_ connection: NWConnection) async {
+        let webEnabled = await MainActor.run {
+            AppSettings.shared.localAPIWebSearchEnabled
+        }
         let payload = LocalAPIResponse.json([
             "name": "On Device LAS",
             "status": "ok",
             "authentication": ["bearer", "x-api-key"],
             "openai_base_url": "/v1",
             "ollama_base_url": "/api",
+            "web_search_default_enabled": webEnabled,
             "endpoints": [
                 "/v1/models",
                 "/v1/models/{model}",
@@ -4543,6 +5529,8 @@ actor LocalAPIServer {
                 "/v1/chat/completions",
                 "/v1/responses",
                 "/v1/messages",
+                "/v1/web/search",
+                "/v1/web/fetch",
                 "/api/tags",
                 "/api/ps",
                 "/api/version",
@@ -4557,6 +5545,94 @@ actor LocalAPIServer {
             contentType: "application/json",
             data: payload
         )
+    }
+
+    private func handleDirectWebSearch(
+        _ request: HTTPRequest,
+        connection: NWConnection
+    ) async {
+        guard request.headers["content-type"]?.lowercased().hasPrefix("application/json") == true else {
+            await error(connection, status: 415, message: "Content-Type must be application/json", dialect: .openAIChat)
+            return
+        }
+        guard let body = request.body,
+              let raw = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any],
+              let query = raw["query"] as? String else {
+            await error(connection, status: 400, message: "JSON body with string 'query' is required", dialect: .openAIChat)
+            return
+        }
+        let maxResults = (raw["max_results"] as? NSNumber)?.intValue ?? 5
+        let fetchTopPages = (raw["fetch_top_pages"] as? Bool) ?? false
+        let configuredProvider = await MainActor.run {
+            WebSearchProvider(rawValue: AppSettings.shared.localAPIWebSearchProvider) ?? .freeAuto
+        }
+        let provider = (raw["provider"] as? String).flatMap(WebSearchProvider.init(rawValue:)) ?? configuredProvider
+
+        do {
+            let result = try await LocalAPIWebToolCoordinator.shared.directSearch(
+                query: query,
+                maxResults: maxResults,
+                fetchTopPages: fetchTopPages,
+                provider: provider
+            )
+            await respond(
+                connection,
+                status: 200,
+                contentType: "application/json",
+                data: LocalAPIResponse.json(result)
+            )
+        } catch let webErr as WebToolError {
+            let status: Int
+            switch webErr {
+            case .blockedByURLValidator, .sensitiveQueryBlocked: status = 400
+            case .rateLimited: status = 429
+            case .timeout: status = 504
+            default: status = 502
+            }
+            await error(connection, status: status, message: webErr.localizedDescription, dialect: .openAIChat)
+        } catch {
+            await self.error(connection, status: 502, message: error.localizedDescription, dialect: .openAIChat)
+        }
+    }
+
+    private func handleDirectWebFetch(
+        _ request: HTTPRequest,
+        connection: NWConnection
+    ) async {
+        guard request.headers["content-type"]?.lowercased().hasPrefix("application/json") == true else {
+            await error(connection, status: 415, message: "Content-Type must be application/json", dialect: .openAIChat)
+            return
+        }
+        guard let body = request.body,
+              let raw = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any],
+              let urlString = raw["url"] as? String,
+              let url = URL(string: urlString.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+            await error(connection, status: 400, message: "JSON body with valid 'url' is required", dialect: .openAIChat)
+            return
+        }
+
+        do {
+            let result = try await LocalAPIWebToolCoordinator.shared.directFetch(url: url)
+            await respond(
+                connection,
+                status: 200,
+                contentType: "application/json",
+                data: LocalAPIResponse.json(result)
+            )
+        } catch let webErr as WebToolError {
+            let status: Int
+            switch webErr {
+            case .blockedByURLValidator, .unsupportedContentType: status = 400
+            case .tooLarge: status = 413
+            case .tooManyRedirects: status = 400
+            case .rateLimited: status = 429
+            case .timeout: status = 504
+            default: status = 502
+            }
+            await error(connection, status: status, message: webErr.localizedDescription, dialect: .openAIChat)
+        } catch {
+            await self.error(connection, status: 502, message: error.localizedDescription, dialect: .openAIChat)
+        }
     }
 
     private func retrieveOpenAIModel(

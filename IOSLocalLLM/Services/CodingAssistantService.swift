@@ -125,6 +125,7 @@ struct GGUFLoadPolicy: Equatable, Sendable {
     let minimumAvailableBytes: Int64
     let gpuLayers: Int32
     let storageBacked: Bool
+    let hardCeilingExceededReason: String?
 
     /// A freshly-unloaded mmap-backed GGUF can leave a few reclaimable pages
     /// charged to the process briefly. The entitled build may admit that
@@ -136,21 +137,58 @@ struct GGUFLoadPolicy: Equatable, Sendable {
     /// clean mmap pages are reclaimable and do not need to remain resident.
     static let storageBackedHeadroom: Int64 = 1_500_000_000
 
-    static func resolve(fileBytes: Int64, pagingEnabled: Bool) -> Self {
+    init(
+        minimumAvailableBytes: Int64,
+        gpuLayers: Int32,
+        storageBacked: Bool,
+        hardCeilingExceededReason: String? = nil
+    ) {
+        self.minimumAvailableBytes = minimumAvailableBytes
+        self.gpuLayers = gpuLayers
+        self.storageBacked = storageBacked
+        self.hardCeilingExceededReason = hardCeilingExceededReason
+    }
+
+    static func resolve(
+        fileBytes: Int64,
+        pagingEnabled: Bool,
+        estimatedKVCacheBytes: Int64 = 0,
+        deviceTotalRAM: Int64 = 0
+    ) -> Self {
+        let hardMaxWeightBytes = deviceTotalRAM > 0
+            ? Int64(Double(deviceTotalRAM) * 0.85)
+            : 0
+        let ceilingError: String? = (hardMaxWeightBytes > 0 && fileBytes > hardMaxWeightBytes)
+            ? String(
+                format: "This GGUF weighs %.1f GB, which exceeds the safe %.1f GB ceiling for a %.0f GB device.",
+                Double(fileBytes) / 1_000_000_000,
+                Double(hardMaxWeightBytes) / 1_000_000_000,
+                Double(deviceTotalRAM) / 1_000_000_000
+            )
+            : nil
+
         if pagingEnabled {
+            let pagingMinimum = max(
+                storageBackedHeadroom,
+                max(0, estimatedKVCacheBytes) + Int64(Double(max(0, fileBytes)) * 0.22) + 450_000_000
+            )
             return .init(
-                minimumAvailableBytes: storageBackedHeadroom,
+                minimumAvailableBytes: pagingMinimum,
                 gpuLayers: 0,
-                storageBacked: true
+                storageBacked: true,
+                hardCeilingExceededReason: ceilingError
             )
         }
 
-        let minimum = Int64(Double(fileBytes) * 1.15) + 500_000_000
+        let baseMinimum = Int64(Double(fileBytes) * 1.15) + 500_000_000
+        let kvAwareMinimum = fileBytes + max(0, estimatedKVCacheBytes) + 500_000_000
+        let minimum = max(baseMinimum, kvAwareMinimum)
         let threeGiB = Int64(3 * 1_024 * 1_024 * 1_024)
         return .init(
             minimumAvailableBytes: minimum,
             gpuLayers: fileBytes > threeGiB ? 12 : 999,
-            storageBacked: false
+            storageBacked: false,
+            hardCeilingExceededReason: ceilingError
         )
     }
 
@@ -158,6 +196,7 @@ struct GGUFLoadPolicy: Equatable, Sendable {
         availableBytes: Int64,
         hasIncreasedMemoryEntitlement: Bool
     ) -> Bool {
+        if hardCeilingExceededReason != nil { return false }
         guard availableBytes > 0 else { return true }
         let grace = hasIncreasedMemoryEntitlement
             ? Self.entitledNearFitGraceBytes
@@ -246,26 +285,42 @@ final class CodingAssistantService: ObservableObject {
         }
     }
 
-    /// Recurrent Gemma 4 remains on its proven compact path. Other imported
-    /// GGUFs — especially Qwen/Qwopus VLMs with a paired projector — use the
-    /// bounded llama.cpp family profile instead of inheriting Gemma's 512-token
-    /// emergency limit, which was too small for agent schemas and image turns.
-    private static func importedGGUFContextTokens(repoID: String) -> UInt32 {
-        let id = repoID.lowercased()
-        if id.contains("gemma-4") || id.contains("gemma4") { return 512 }
-        return LlamaCppVLMExecutionProfile.resolve(repoID: repoID).contextSize
+    /// Conservative 8 GB iPad-safe GGUF context & output envelope shared by
+    /// `ModelCapabilityProfile`, `LocalAPIServer`, and `LlamaCppVLM`.
+    private static func importedGGUFProfile(
+        repoID: String,
+        header: LocalModelFileValidator.GGUFHeaderMetadata? = nil,
+        availableBytes: Int64 = MemoryAdvisor.availableMemoryForModel,
+        hasIncreasedMemoryEntitlement: Bool = MemoryAdvisor.hasIncreasedMemoryLimitEntitlement
+    ) -> GGUFExecutionProfile {
+        GGUFExecutionProfile.resolve(
+            repoID: repoID,
+            ggufArchitecture: header?.architecture,
+            metadataContextLength: header?.contextLength,
+            availableBytes: availableBytes,
+            hasIncreasedMemoryEntitlement: hasIncreasedMemoryEntitlement
+        )
     }
 
-    private static func importedGGUFMaxOutputTokens(repoID: String) -> Int {
-        let id = repoID.lowercased()
-        if id.contains("gemma-4") || id.contains("gemma4") { return 128 }
-        return LlamaCppVLMExecutionProfile.resolve(repoID: repoID).maxOutputTokens
+    private static func importedGGUFContextTokens(
+        repoID: String,
+        header: LocalModelFileValidator.GGUFHeaderMetadata? = nil
+    ) -> UInt32 {
+        UInt32(importedGGUFProfile(repoID: repoID, header: header).contextTokens)
     }
 
-    private static func importedGGUFInputBudget(repoID: String) -> Int {
-        let context = Int(importedGGUFContextTokens(repoID: repoID))
-        let output = importedGGUFMaxOutputTokens(repoID: repoID)
-        return max(320, context - output - 256)
+    private static func importedGGUFMaxOutputTokens(
+        repoID: String,
+        header: LocalModelFileValidator.GGUFHeaderMetadata? = nil
+    ) -> Int {
+        importedGGUFProfile(repoID: repoID, header: header).maxOutputTokens
+    }
+
+    private static func importedGGUFInputBudget(
+        repoID: String,
+        header: LocalModelFileValidator.GGUFHeaderMetadata? = nil
+    ) -> Int {
+        importedGGUFProfile(repoID: repoID, header: header).inputBudgetTokens
     }
 
     @Published private(set) var state: ServiceState = .unloaded
@@ -305,7 +360,10 @@ final class CodingAssistantService: ObservableObject {
             )
         }
         if activeModel.runtime == .llamaCpp {
-            return Self.importedGGUFInputBudget(repoID: activeModel.repoID)
+            return Self.importedGGUFInputBudget(
+                repoID: activeModel.repoID,
+                header: ggufHeaderMetadata
+            )
         }
         let executionProfile = MLXAssistantExecutionProfile.resolve(
             repoID: activeModel.repoID,
@@ -331,7 +389,10 @@ final class CodingAssistantService: ObservableObject {
             return max(
                 1,
                 min(
-                    Self.importedGGUFMaxOutputTokens(repoID: activeModel.repoID),
+                    Self.importedGGUFMaxOutputTokens(
+                        repoID: activeModel.repoID,
+                        header: ggufHeaderMetadata
+                    ),
                     DeviceSafetyMonitor.shared.recommendedMaxTokens
                 )
             )
@@ -461,6 +522,7 @@ final class CodingAssistantService: ObservableObject {
     /// Non-nil only when the resident GGUF was loaded with a validated mtmd
     /// projector. The path is diagnostic state only; it is never logged.
     private var ggufVisionProjectorPath: String?
+    private var ggufHeaderMetadata: LocalModelFileValidator.GGUFHeaderMetadata?
     private var generateTask: Task<Void, Never>?
     private var pccGenerateTask: Task<Void, Never>?
     /// Bumped by `stopGeneration`. A request parked waiting for a busy or
@@ -1563,9 +1625,8 @@ final class CodingAssistantService: ObservableObject {
                 operation: "Validating imported GGUF",
                 detail: "Checking the model file and selected memory policy."
             )
-            guard let directory = Self.preStagedDirectory(for: activeModel),
-                  let modelURL = LocalModelFileValidator.ggufLLM(in: directory) else {
-                let message = "The imported GGUF file could not be found on disk."
+            guard let directory = Self.preStagedDirectory(for: activeModel) else {
+                let message = "The imported GGUF directory could not be found on disk."
                 state = .failed(message)
                 finishLoadDebug(phase: .failed, operation: "GGUF validation failed", detail: message, error: message)
                 return
@@ -1577,10 +1638,23 @@ final class CodingAssistantService: ObservableObject {
             }
             do {
                 try Task.checkCancellation()
-                // Gemma 4 keeps its proven 512-token recurrent profile; Qwen /
-                // Qwopus and other imported GGUFs receive the bounded 4K VLM
-                // profile so image prompts and tool schemas are not truncated.
-                let context = Self.importedGGUFContextTokens(repoID: activeModel.repoID)
+                guard let modelURL = LocalModelFileValidator.ggufLLM(in: directory) else {
+                    let rootValidation = LocalModelFileValidator.validateModelRoot(directory)
+                    let reason = rootValidation.failures.first
+                        ?? "The imported GGUF file could not be found or is unsupported."
+                    throw RuntimeError.modelLoadBlocked(reason: reason)
+                }
+                let headerMeta = try LocalModelFileValidator.validateGGUFForAssistant(modelURL)
+                let available = MemoryAdvisor.availableMemoryForModel
+                let entitled = MemoryAdvisor.hasIncreasedMemoryLimitEntitlement
+                let ggufProfile = GGUFExecutionProfile.resolve(
+                    repoID: activeModel.repoID,
+                    ggufArchitecture: headerMeta.architecture,
+                    metadataContextLength: headerMeta.contextLength,
+                    availableBytes: available,
+                    hasIncreasedMemoryEntitlement: entitled
+                )
+                let context = UInt32(ggufProfile.contextTokens)
                 let projectorURL = LocalModelFileValidator.ggufProjector(in: directory)
                 let modelBytes = ((try? FileManager.default.attributesOfItem(atPath: modelURL.path))?[.size] as? NSNumber)?.int64Value ?? 0
                 let projectorBytes = projectorURL.flatMap {
@@ -1590,15 +1664,19 @@ final class CodingAssistantService: ObservableObject {
                 // metadata. Include it in admission or a 922 MB F32 mmproj can
                 // turn an apparently safe Q3 model into a jetsam load.
                 let fileBytes = modelBytes + projectorBytes
-                let available = MemoryAdvisor.availableMemoryForModel
                 let loadPolicy = GGUFLoadPolicy.resolve(
                     fileBytes: fileBytes,
-                    pagingEnabled: AppSettings.shared.largeModelLowMemoryEnabled
+                    pagingEnabled: AppSettings.shared.largeModelLowMemoryEnabled,
+                    estimatedKVCacheBytes: ggufProfile.estimatedKVCacheBytes,
+                    deviceTotalRAM: MemoryAdvisor.deviceTotalRAM
                 )
+                if let ceilingError = loadPolicy.hardCeilingExceededReason {
+                    throw RuntimeError.modelLoadBlocked(reason: ceilingError)
+                }
                 let minimumNeeded = loadPolicy.minimumAvailableBytes
                 guard fileBytes == 0 || loadPolicy.canAdmit(
                     availableBytes: available,
-                    hasIncreasedMemoryEntitlement: MemoryAdvisor.hasIncreasedMemoryLimitEntitlement
+                    hasIncreasedMemoryEntitlement: entitled
                 ) else {
                     throw RuntimeError.modelLoadBlocked(reason: String(
                         format: "This GGUF needs about %.1f GB available in the selected loading mode; the app currently has %.1f GB. Close other apps, enable storage-backed paging, or use a smaller quantization.",
@@ -1608,7 +1686,7 @@ final class CodingAssistantService: ObservableObject {
                 }
                 let gpuLayers = loadPolicy.gpuLayers
                 Diagnostics.shared.breadcrumb(
-                    "GGUF assistant load · bytes=\(fileBytes) · multimodal=\(projectorURL != nil) · context=\(context) · available=\(available) · gpuLayers=\(gpuLayers) · storageBacked=\(loadPolicy.storageBacked)",
+                    "GGUF assistant load · arch=\(headerMeta.architecture ?? "unknown") · bytes=\(fileBytes) · multimodal=\(projectorURL != nil) · context=\(context) · available=\(available) · gpuLayers=\(gpuLayers) · storageBacked=\(loadPolicy.storageBacked)",
                     category: "assistant"
                 )
                 var loadedRuntime: LlamaCppVLM? = try await Task.detached(priority: .userInitiated) {
@@ -1639,6 +1717,7 @@ final class CodingAssistantService: ObservableObject {
                 ggufModel = loaded
                 loadedRuntime = nil
                 ggufVisionProjectorPath = projectorURL?.path
+                ggufHeaderMetadata = headerMeta
                 Diagnostics.shared.breadcrumb(
                     "GGUF assistant loaded · footprint=\(MemoryAdvisor.physFootprint) · headroom=\(MemoryAdvisor.availableMemoryForModel) · gpuLayers=\(gpuLayers)",
                     category: "assistant"
@@ -1657,6 +1736,7 @@ final class CodingAssistantService: ObservableObject {
             } catch {
                 ggufModel = nil
                 ggufVisionProjectorPath = nil
+                ggufHeaderMetadata = nil
                 if Self.isCancellationError(error) || Task.isCancelled {
                     state = .unloaded
                     finishLoadDebug(
@@ -2589,29 +2669,26 @@ final class CodingAssistantService: ObservableObject {
         // gate never accounted for. 8-bit KV quantization (above) halves the
         // per-token cost; this cap bounds the count.
         let isImportedGGUF = activeModel.runtime == .llamaCpp
+        let ggufArch = isImportedGGUF
+            ? (ggufHeaderMetadata?.architecture ?? ggufModel?.metadataString(forKey: "general.architecture"))
+            : nil
+        let template = isImportedGGUF
+            ? ChatTemplate.detect(for: activeModel.repoID, ggufArchitecture: ggufArch)
+            : activeModel.chatTemplate
         let messagesForRuntime: [ChatMessage]
-        if isImportedGGUF {
-            // Imported recurrent Gemma models do not accept system turns, but
-            // long-conversation memory must not disappear with the rest of the
-            // system prompt. Recast only our bounded memory record as ordinary
-            // chat context; persona/tool system instructions remain excluded.
-            messagesForRuntime = effectiveMessages.compactMap { message in
-                guard message.role == .system else { return message }
-                guard message.content.hasPrefix("[CONVERSATION MEMORY]") else {
-                    return nil
-                }
-                return ChatMessage(
-                    id: message.id,
-                    role: .user,
-                    content: message.content,
-                    timestamp: message.timestamp
-                )
-            }
+        if isImportedGGUF, template.systemPrefix.isEmpty {
+            // Only legacy Gemma 2/3 lacks a native system turn. Qwen3.5,
+            // Gemma 4, ChatML, Llama 3, and Phi accept system messages
+            // (including OpenAI system prompts and Gemma 4 tool declarations).
+            messagesForRuntime = effectiveMessages
         } else {
             messagesForRuntime = effectiveMessages
         }
         let inputBudget = isImportedGGUF
-            ? Self.importedGGUFInputBudget(repoID: activeModel.repoID)
+            ? Self.importedGGUFInputBudget(
+                repoID: activeModel.repoID,
+                header: ggufHeaderMetadata
+            )
             : executionProfile.inputBudget(
                 modelContextWindowTokens: executionProfile.maxContextTokens,
                 deviceContextCap: executionProfile.maxContextTokens,
@@ -2627,7 +2704,6 @@ final class CodingAssistantService: ObservableObject {
         // --- Chat Template Support (Feature #6) ---
         // Use the model's resolved chat template instead of hardcoded Qwen3 template.
         // Non-ChatML models (Llama, Gemma, Phi) now get proper formatting.
-        let template = activeModel.chatTemplate
         let enableThinking = resolvedThinkingEnabled(forceNoThinking: forceNoThinking)
         let manualPrompt: String? = template.supportsThinking
             ? trimmedMessages.formattedWithTemplate(template, enableThinking: enableThinking)
@@ -2673,8 +2749,12 @@ final class CodingAssistantService: ObservableObject {
             let loggedFirstToken = OSAllocatedUnfairLock(initialState: false)
             let ggufMaxTokens = min(
                 safeMaxTokens,
-                Self.importedGGUFMaxOutputTokens(repoID: activeModel.repoID)
+                Self.importedGGUFMaxOutputTokens(
+                    repoID: activeModel.repoID,
+                    header: ggufHeaderMetadata
+                )
             )
+            let ggufStopSequences = template.extraEOSTokens
             let ggufPrompt: String = {
                 if let manualPrompt, !manualPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     return manualPrompt
@@ -2750,6 +2830,7 @@ final class CodingAssistantService: ObservableObject {
                             prompt: ggufPrompt,
                             maxTokens: ggufMaxTokens,
                             samplerSpec: ggufSampler,
+                            stopSequences: ggufStopSequences,
                             onToken: tokenSink
                         )
                         rate = result.tokensPerSecond
@@ -3731,6 +3812,7 @@ final class CodingAssistantService: ObservableObject {
         let ggufRelease = GGUFRuntimeReleaseBox(ggufModel)
         ggufModel = nil
         ggufVisionProjectorPath = nil
+        ggufHeaderMetadata = nil
         let mlxRelease = MLXContainerReleaseBox(container)
         container = nil
         Diagnostics.shared.breadcrumb(

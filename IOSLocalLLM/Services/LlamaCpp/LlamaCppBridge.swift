@@ -303,6 +303,22 @@ final class LlamaCppVLM: @unchecked Sendable {
         return Int(written)
     }
 
+    /// Reads a UTF-8 string metadata value (such as `general.architecture`)
+    /// directly from the loaded `llama_model`.
+    func metadataString(forKey key: String) -> String? {
+        guard let m = model else { return nil }
+        return key.withCString { keyPtr in
+            var buffer = [CChar](repeating: 0, count: 512)
+            let count = buffer.withUnsafeMutableBufferPointer { buf in
+                llama_model_meta_val_str(m, keyPtr, buf.baseAddress, buf.count)
+            }
+            guard count > 0 else { return nil }
+            let byteCount = min(Int(count), buffer.count - 1)
+            let bytes = buffer.prefix(byteCount).map { UInt8(bitPattern: $0) }
+            return String(decoding: bytes, as: UTF8.self)
+        }
+    }
+
     /// Runs an already chat-formatted prompt through the resident GGUF. This
     /// also works when an mtmd projector is attached: text-only turns use the
     /// normal tokenizer/context, while image turns enter `describe` below.
@@ -310,6 +326,7 @@ final class LlamaCppVLM: @unchecked Sendable {
         prompt: String,
         maxTokens: Int,
         samplerSpec: LlamaCppSamplerSpec? = nil,
+        stopSequences: [String] = [],
         onToken: @escaping (String) -> Void
     ) throws -> LlamaCppTextGenerationResult {
         guard let m = model else {
@@ -372,7 +389,7 @@ final class LlamaCppVLM: @unchecked Sendable {
         // the final guard because character estimates vary substantially by
         // language and community tokenizer. Preserve the first special token
         // (BOS for this Gemma tokenizer), then take the newest prompt suffix.
-        let requestedOutputTokens = max(1, min(maxTokens, Int(configuredContextSize) / 4))
+        let requestedOutputTokens = max(1, min(maxTokens, Int(configuredContextSize) / 2))
         let promptTokenLimit = max(1, Int(configuredContextSize) - requestedOutputTokens - 1)
         if tokens.count > promptTokenLimit {
             if promptTokenLimit > 1, let firstToken = tokens.first {
@@ -460,6 +477,8 @@ final class LlamaCppVLM: @unchecked Sendable {
         var pendingUTF8: [UInt8] = []
         pendingUTF8.reserveCapacity(16)
         var pieceBuffer = [Int8](repeating: 0, count: 256)
+        let activeStops = stopSequences.filter { !$0.isEmpty }
+        var stopHoldback = ""
         llama_sampler_reset(samp)
 
         for _ in 0..<generationLimit {
@@ -480,7 +499,22 @@ final class LlamaCppVLM: @unchecked Sendable {
                     pendingUTF8.append(UInt8(bitPattern: pieceBuffer[index]))
                 }
                 let piece = Self.consumeCompleteUTF8Prefix(&pendingUTF8)
-                if !piece.isEmpty { onToken(piece) }
+                if !piece.isEmpty {
+                    if activeStops.isEmpty {
+                        onToken(piece)
+                    } else {
+                        stopHoldback += piece
+                        let outcome = Self.drainStopSequenceBuffer(&stopHoldback, stopSequences: activeStops)
+                        if !outcome.emitted.isEmpty {
+                            onToken(outcome.emitted)
+                        }
+                        if outcome.matchedStop {
+                            reachedEndOfGeneration = true
+                            tokensGenerated += 1
+                            break
+                        }
+                    }
+                }
             }
             tokensGenerated += 1
 
@@ -492,7 +526,23 @@ final class LlamaCppVLM: @unchecked Sendable {
         }
 
         if !pendingUTF8.isEmpty {
-            onToken(String(decoding: pendingUTF8, as: UTF8.self))
+            let remainder = String(decoding: pendingUTF8, as: UTF8.self)
+            if activeStops.isEmpty {
+                onToken(remainder)
+            } else {
+                stopHoldback += remainder
+            }
+        }
+        if !stopHoldback.isEmpty, !reachedEndOfGeneration {
+            onToken(stopHoldback)
+        } else if !stopHoldback.isEmpty, reachedEndOfGeneration {
+            let outcome = Self.drainStopSequenceBuffer(&stopHoldback, stopSequences: activeStops)
+            if !outcome.emitted.isEmpty {
+                onToken(outcome.emitted)
+            }
+            if !outcome.matchedStop, !stopHoldback.isEmpty {
+                onToken(stopHoldback)
+            }
         }
         return LlamaCppTextGenerationResult(
             tokensPerSecond: Self.tokensPerSec(
@@ -503,6 +553,48 @@ final class LlamaCppVLM: @unchecked Sendable {
             completionTokenCount: tokensGenerated,
             stopReason: reachedEndOfGeneration ? .stop : .length
         )
+    }
+
+    private static func drainStopSequenceBuffer(
+        _ buffer: inout String,
+        stopSequences: [String]
+    ) -> (emitted: String, matchedStop: Bool) {
+        guard !buffer.isEmpty else { return ("", false) }
+        var earliestMatch: Range<String.Index>?
+        for stop in stopSequences {
+            if let range = buffer.range(of: stop) {
+                if earliestMatch == nil || range.lowerBound < earliestMatch!.lowerBound {
+                    earliestMatch = range
+                }
+            }
+        }
+        if let match = earliestMatch {
+            let prefix = String(buffer[..<match.lowerBound])
+            buffer = ""
+            return (prefix, true)
+        }
+        // Hold back only the longest suffix of `buffer` that is a proper prefix
+        // of any configured stop sequence.
+        var holdCount = 0
+        for stop in stopSequences {
+            let maxCheck = min(buffer.count, stop.count - 1)
+            guard maxCheck > holdCount else { continue }
+            for length in stride(from: maxCheck, through: holdCount + 1, by: -1) {
+                if buffer.suffix(length) == stop.prefix(length) {
+                    holdCount = length
+                    break
+                }
+            }
+        }
+        if holdCount == 0 {
+            let emitted = buffer
+            buffer = ""
+            return (emitted, false)
+        }
+        let splitIndex = buffer.index(buffer.endIndex, offsetBy: -holdCount)
+        let emitted = String(buffer[..<splitIndex])
+        buffer = String(buffer[splitIndex...])
+        return (emitted, false)
     }
 
     // MARK: - Describe

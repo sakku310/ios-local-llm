@@ -20,7 +20,10 @@ public enum WebAccessMode: String, Codable, Sendable, CaseIterable, Identifiable
 
 public enum WebSearchProvider: String, Codable, Sendable, CaseIterable, Identifiable {
     case directURLOnly
-    case duckduckgoHTML       // best-effort HTML scrape — may break
+    case freeAuto             // keyless free cascade: DDG Instant/HTML + Wikimedia (no paid key)
+    case wikimedia            // Wikipedia MediaWiki Action API (CC BY-SA, keyless JSON)
+    case duckduckgoInstant    // DuckDuckGo Instant Answer JSON API (keyless)
+    case duckduckgoHTML       // best-effort HTML scrape — may break or rate-limit
     case brave                // requires API key (Keychain)
     case tavily               // requires API key (Keychain); LLM-optimized
     case exa                  // requires API key (Keychain); LLM-optimized
@@ -31,13 +34,16 @@ public enum WebSearchProvider: String, Codable, Sendable, CaseIterable, Identifi
     /// Display name for UI.
     public var displayName: String {
         switch self {
-        case .directURLOnly:   return "Direct URL only"
-        case .duckduckgoHTML:  return "DuckDuckGo (HTML, experimental)"
-        case .brave:           return "Brave Search"
-        case .tavily:          return "Tavily (RAG-tuned)"
-        case .exa:             return "Exa (RAG-tuned)"
-        case .searxng:         return "SearXNG (self-hosted)"
-        case .custom:          return "Custom endpoint"
+        case .directURLOnly:     return "Direct URL only"
+        case .freeAuto:          return "Free Web Search (Auto)"
+        case .wikimedia:         return "Wikipedia API (Free)"
+        case .duckduckgoInstant: return "DuckDuckGo Instant API (Free)"
+        case .duckduckgoHTML:    return "DuckDuckGo (HTML, experimental)"
+        case .brave:             return "Brave Search"
+        case .tavily:            return "Tavily (RAG-tuned)"
+        case .exa:               return "Exa (RAG-tuned)"
+        case .searxng:           return "SearXNG (self-hosted)"
+        case .custom:            return "Custom endpoint"
         }
     }
 
@@ -218,6 +224,9 @@ public enum WebToolError: Error, Sendable, LocalizedError {
     case blockedByURLValidator(reason: String)
     case robotsDenied(url: URL)
     case rateLimited(retryAfter: TimeInterval?)
+    case tooManyRedirects(max: Int)
+    case antiBotChallenge(provider: String)
+    case sensitiveQueryBlocked(reason: String)
     case timeout
     case tooLarge(bytes: Int)
     case unsupportedContentType(String)
@@ -238,6 +247,9 @@ public enum WebToolError: Error, Sendable, LocalizedError {
         case .blockedByURLValidator(let r):return "URL blocked: \(r)"
         case .robotsDenied(let u):         return "robots.txt disallows fetching \(u.host ?? "this URL")."
         case .rateLimited(let secs):       return "Rate-limited. Retry after \(secs.map { "\(Int($0))s" } ?? "a moment")."
+        case .tooManyRedirects(let max):   return "Blocked after exceeding maximum redirect limit (\(max))."
+        case .antiBotChallenge(let p):     return "\(p) returned an anti-bot challenge; request stopped without bypassing."
+        case .sensitiveQueryBlocked(let r):return "Search query blocked for privacy: \(r)"
         case .timeout:                     return "Web request timed out."
         case .tooLarge(let n):             return "Page too large (\(Int64(n).formattedBytes))."
         case .unsupportedContentType(let t): return "Unsupported content type: \(t)."

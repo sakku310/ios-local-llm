@@ -40,13 +40,14 @@ final class URLSafetyValidatorTests: XCTestCase {
     }
 
     func test_validateStable_agreesWithSingleValidateOnPublicHost() async {
-        let validator = URLSafetyValidator()
+        let validator = URLSafetyValidator(resolver: { host in
+            host == "example.com" ? ["93.184.216.34"] : []
+        })
         let url = URL(string: "https://example.com")!
         let single = await validator.validate(url)
         let stable = await validator.validateStable(url)
+        XCTAssertTrue(single.isSafe)
         XCTAssertEqual(single.isSafe, stable.isSafe)
-        if single.isSafe {
-            XCTAssertEqual(Set(single.resolvedIPs), Set(stable.resolvedIPs))
-        }
+        XCTAssertEqual(Set(single.resolvedIPs), Set(stable.resolvedIPs))
     }
 }

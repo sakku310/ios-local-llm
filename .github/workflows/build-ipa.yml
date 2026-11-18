@@ -92,7 +92,7 @@ jobs:
           xcodegen --version
           pod --version
 
-      - name: Build llama.cpp iOS device arm64 XCFramework and remove intermediates
+      - name: Build llama.cpp iOS XCFramework (device + arm64 simulator) and remove intermediates
         shell: bash
         run: |
           set -euo pipefail
@@ -103,10 +103,12 @@ jobs:
 
           llama_root="${GITHUB_WORKSPACE}/ThirdParty/llama.cpp"
           helper_file="$(mktemp "${RUNNER_TEMP:-/tmp}/llama-xcframework-helpers.XXXXXX")"
-          trap 'rm -f "${helper_file}"' EXIT
+          stage_root="$(mktemp -d "${RUNNER_TEMP:-/tmp}/llama-xcf-stage.XXXXXX")"
+          trap 'rm -rf "${helper_file}" "${stage_root}"' EXIT
 
           # Source upstream options and packaging helpers from pinned llama.cpp
-          # so we build ONLY the iOS device arm64 slice (skipping Simulator arm64+x86_64).
+          # so we build ONLY arm64 Simulator (for OnDeviceLASTests) + arm64 Device
+          # sequentially, deleting each CMake build tree immediately to protect SSD space.
           awk '
             /^IOS_MIN_OS_VERSION=/ { copying = 1 }
             /^check_required_tool\(\)/ && copying { copying = 0 }
@@ -127,7 +129,29 @@ jobs:
               exit 1
             fi
 
-            rm -rf build-apple build-ios-device
+            rm -rf build-apple build-ios-sim build-ios-device
+
+            echo "Building llama.cpp for iOS Simulator (arm64 only, for offline XCTest)..."
+            cmake -B build-ios-sim -G Xcode \
+              "${COMMON_CMAKE_ARGS[@]}" \
+              -DCMAKE_OSX_DEPLOYMENT_TARGET="${IOS_MIN_OS_VERSION}" \
+              -DCMAKE_SYSTEM_NAME=iOS \
+              -DCMAKE_OSX_SYSROOT=iphonesimulator \
+              -DCMAKE_OSX_ARCHITECTURES="arm64" \
+              -DCMAKE_XCODE_ATTRIBUTE_SUPPORTED_PLATFORMS=iphonesimulator \
+              -DCMAKE_C_FLAGS="${COMMON_C_FLAGS}" \
+              -DCMAKE_CXX_FLAGS="${COMMON_CXX_FLAGS}" \
+              -DLLAMA_OPENSSL=OFF \
+              -DMTMD_VIDEO=OFF \
+              -S .
+            cmake --build build-ios-sim --config Release -j 2 -- -quiet
+
+            setup_framework_structure "build-ios-sim" "${IOS_MIN_OS_VERSION}" "ios"
+            combine_static_libraries "build-ios-sim" "Release-iphonesimulator" "ios" "true"
+            mkdir -p "${stage_root}/sim"
+            mv build-ios-sim/framework "${stage_root}/sim/framework"
+            mv build-ios-sim/dSYMs "${stage_root}/sim/dSYMs"
+            rm -rf build-ios-sim
 
             echo "Building llama.cpp for iOS device (arm64 only)..."
             cmake -B build-ios-device -G Xcode \
@@ -146,24 +170,34 @@ jobs:
 
             setup_framework_structure "build-ios-device" "${IOS_MIN_OS_VERSION}" "ios"
             combine_static_libraries "build-ios-device" "Release-iphoneos" "ios" "false"
+            mkdir -p "${stage_root}/device"
+            mv build-ios-device/framework "${stage_root}/device/framework"
+            mv build-ios-device/dSYMs "${stage_root}/device/dSYMs"
+            rm -rf build-ios-device
 
             mkdir -p build-apple
             xcrun xcodebuild -create-xcframework \
-              -framework "$(pwd)/build-ios-device/framework/llama.framework" \
-              -debug-symbols "$(pwd)/build-ios-device/dSYMs/llama.dSYM" \
+              -framework "${stage_root}/sim/framework/llama.framework" \
+              -debug-symbols "${stage_root}/sim/dSYMs/llama.dSYM" \
+              -framework "${stage_root}/device/framework/llama.framework" \
+              -debug-symbols "${stage_root}/device/dSYMs/llama.dSYM" \
               -output "$(pwd)/build-apple/llama.xcframework"
           )
 
           xcframework_dir="${llama_root}/build-apple/llama.xcframework"
           device_binary="${xcframework_dir}/ios-arm64/llama.framework/llama"
+          sim_binary="${xcframework_dir}/ios-arm64-simulator/llama.framework/llama"
           if [[ ! -s "${device_binary}" ]]; then
             echo "error: expected device framework binary not found at ${device_binary}" >&2
             exit 1
           fi
+          if [[ ! -s "${sim_binary}" ]]; then
+            echo "error: expected simulator framework binary not found at ${sim_binary}" >&2
+            exit 1
+          fi
           ls -la "${xcframework_dir}"
 
-          # Remove intermediate CMake/Xcode build directory inside GITHUB_WORKSPACE
-          rm -rf "${llama_root}/build-ios-device"
+          rm -rf "${llama_root}/build-ios-sim" "${llama_root}/build-ios-device"
           df -h
 
       - name: Generate Xcode project and CocoaPods workspace
@@ -203,6 +237,64 @@ jobs:
             -derivedDataPath "${GITHUB_WORKSPACE}/build"
           df -h
 
+      - name: Run offline unit tests (OnDeviceLASTests)
+        shell: bash
+        env:
+          ONDEVICELAS_RUN_LIVE_NETWORK_TESTS: "0"
+        run: |
+          set -euo pipefail
+          sim_udid="$(python3 - <<'PY'
+          import json
+          import subprocess
+          import sys
+
+          raw = subprocess.check_output(["xcrun", "simctl", "list", "devices", "available", "-j"], text=True)
+          data = json.loads(raw)
+          devices_by_runtime = data.get("devices", {})
+          candidates = []
+          for runtime in sorted(devices_by_runtime.keys(), reverse=True):
+              if "iOS" not in runtime:
+                  continue
+              for dev in devices_by_runtime.get(runtime, []):
+                  if not dev.get("isAvailable"):
+                      continue
+                  name = dev.get("name", "")
+                  udid = dev.get("udid", "")
+                  if udid and ("iPad" in name or "iPhone" in name):
+                      priority = 0 if "iPad" in name else 1
+                      candidates.append((priority, runtime, name, udid))
+          if not candidates:
+              raise SystemExit("error: no available iOS Simulator device found for OnDeviceLASTests")
+          candidates.sort(key=lambda item: (item[0]))
+          chosen = candidates[0]
+          print(f"Selected simulator: {chosen[2]} ({chosen[1]})", file=sys.stderr)
+          print(chosen[3])
+          PY
+          )"
+
+          if [[ -z "${sim_udid}" ]]; then
+            echo "error: failed to resolve iOS Simulator UDID" >&2
+            exit 1
+          fi
+
+          xcodebuild test \
+            -workspace "${GITHUB_WORKSPACE}/OnDeviceLAS.xcworkspace" \
+            -scheme OnDeviceLAS \
+            -destination "platform=iOS Simulator,id=${sim_udid}" \
+            -derivedDataPath "${GITHUB_WORKSPACE}/build" \
+            -only-testing:OnDeviceLASTests \
+            -skip-testing:OnDeviceLASTests/Phase3OptionalLiveNetworkTests \
+            -parallel-testing-enabled NO \
+            -jobs 2 \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_REQUIRED=NO \
+            DEVELOPMENT_TEAM=""
+
+          xcrun simctl shutdown all || true
+          # Reclaim Debug Simulator build products while preserving build/SourcePackages
+          rm -rf "${GITHUB_WORKSPACE}/build/Build"
+          df -h
+
       - name: Build unsigned Release iOS app (arm64 device slice)
         shell: bash
         run: |
@@ -220,7 +312,7 @@ jobs:
             DEVELOPMENT_TEAM="" \
             VALIDATE_PRODUCT=NO
 
-      - name: Verify app bundle metadata and package unsigned IPA
+      - name: Verify app bundle metadata, resources, port 11434, ZIP structure, and SHA-256
         shell: bash
         run: |
           set -euo pipefail
@@ -238,11 +330,13 @@ jobs:
           # Free compiler intermediates before duplicating Payload/ and zipping IPA on 14 GB SSD
           rm -rf "${GITHUB_WORKSPACE}/build/Build/Intermediates.noindex"
 
-          python3 - "${app_path}/Info.plist" <<'PY'
+          # 1. Verify Bundle ID and UIDeviceFamily in Info.plist
+          python3 - "${app_path}/Info.plist" "${GITHUB_WORKSPACE}/IOSLocalLLM/Models/AppSettings.swift" "${GITHUB_WORKSPACE}/IOSLocalLLM/ContentView.swift" <<'PY'
           import plistlib
+          import re
           import sys
 
-          plist_path = sys.argv[1]
+          plist_path, settings_path, content_view_path = sys.argv[1], sys.argv[2], sys.argv[3]
           with open(plist_path, "rb") as f:
               info = plistlib.load(f)
 
@@ -255,12 +349,35 @@ jobs:
               raise SystemExit(f"error: unexpected CFBundleIdentifier {bundle_id!r}")
           if not ({1, 2}.issubset(set(device_family))):
               raise SystemExit(f"error: UIDeviceFamily {device_family!r} does not include both iPhone (1) and iPad (2)")
+
+          with open(settings_path, "r", encoding="utf-8") as f:
+              settings_src = f.read()
+          with open(content_view_path, "r", encoding="utf-8") as f:
+              view_src = f.read()
+
+          if not re.search(r'@AppStorage\("localAPIPort"\)\s+var\s+localAPIPort:\s*Int\s*=\s*11_?434\b', settings_src):
+              raise SystemExit("error: AppSettings.localAPIPort default is not 11434")
+          if not re.search(r'@AppStorage\("localAPIPort"\)\s+private\s+var\s+port\s*=\s*11_?434\b', view_src):
+              raise SystemExit("error: ContentView localAPIPort default is not 11434")
+          print("Verified default API port configuration: 11434")
           PY
 
-          if [[ -e "${app_path}/embedded.mobileprovision" || -d "${app_path}/_CodeSignature" ]]; then
-            echo "warning: unexpected signing artifacts present in unsigned build" >&2
+          # 2. Verify arm64 Mach-O architecture and unsigned state
+          app_archs="$(lipo -archs "${app_path}/OnDeviceLAS")"
+          llama_archs="$(lipo -archs "${app_path}/Frameworks/llama.framework/llama")"
+          echo "OnDeviceLAS architectures: ${app_archs}"
+          echo "llama.framework architectures: ${llama_archs}"
+          if [[ "${app_archs}" != "arm64" || "${llama_archs}" != "arm64" ]]; then
+            echo "error: expected arm64-only device binaries (got app='${app_archs}', llama='${llama_archs}')" >&2
+            exit 1
           fi
 
+          if [[ -e "${app_path}/embedded.mobileprovision" || -d "${app_path}/_CodeSignature" ]]; then
+            echo "error: unexpected signing artifacts present in unsigned build" >&2
+            exit 1
+          fi
+
+          # 3. Package unsigned IPA
           payload_dir="${GITHUB_WORKSPACE}/Payload"
           ipa_path="${GITHUB_WORKSPACE}/OnDeviceLAS-unsigned.ipa"
           rm -rf "${payload_dir}" "${ipa_path}"
@@ -277,18 +394,41 @@ jobs:
             exit 1
           fi
 
+          # 4. Verify ZIP archive integrity and required embedded frameworks/resources
+          unzip -tq "${ipa_path}"
           ipa_entries="$(zipinfo -1 "${ipa_path}")"
           for required_entry in \
             "Payload/OnDeviceLAS.app/OnDeviceLAS" \
             "Payload/OnDeviceLAS.app/Info.plist" \
-            "Payload/OnDeviceLAS.app/Frameworks/llama.framework/llama"; do
+            "Payload/OnDeviceLAS.app/Assets.car" \
+            "Payload/OnDeviceLAS.app/PrivacyInfo.xcprivacy" \
+            "Payload/OnDeviceLAS.app/Frameworks/llama.framework/llama" \
+            "Payload/OnDeviceLAS.app/Frameworks/llama.framework/Info.plist" \
+            "Payload/OnDeviceLAS.app/mlx-swift_Cmlx.bundle/default.metallib"; do
             if ! grep -Fxq "${required_entry}" <<<"${ipa_entries}"; then
               echo "error: missing required entry '${required_entry}' inside ${ipa_path}" >&2
               exit 1
             fi
           done
-          echo "Verified Payload/OnDeviceLAS.app structure inside OnDeviceLAS-unsigned.ipa"
+          echo "Verified Payload/OnDeviceLAS.app structure and required resources inside OnDeviceLAS-unsigned.ipa"
+
+          # 5. Record size and SHA-256
+          ipa_bytes="$(stat -f '%z' "${ipa_path}")"
+          ipa_sha256="$(shasum -a 256 "${ipa_path}" | awk '{ print $1 }')"
+          echo "IPA file: OnDeviceLAS-unsigned.ipa"
+          echo "IPA size (bytes): ${ipa_bytes}"
+          echo "IPA SHA-256: ${ipa_sha256}"
           ls -lh "${ipa_path}"
+          if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+            {
+              echo "### OnDeviceLAS Unsigned IPA Build Summary"
+              echo "- **File**: \`OnDeviceLAS-unsigned.ipa\`"
+              echo "- **Size**: \`${ipa_bytes}\` bytes"
+              echo "- **SHA-256**: \`${ipa_sha256}\`"
+              echo "- **Bundle ID**: \`com.local.ondevicelas\`"
+              echo "- **Default API Port**: \`11434\`"
+            } >> "${GITHUB_STEP_SUMMARY}"
+          fi
           df -h
 
       - name: Upload unsigned IPA artifact
