@@ -180,14 +180,14 @@ targets:
         LSSupportsOpeningDocumentsInPlace: true
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.mesutcydev.ondevicelas
+        PRODUCT_BUNDLE_IDENTIFIER: com.local.ondevicelas
         INFOPLIST_FILE: IOSLocalLLM/Info.plist
         CODE_SIGN_ENTITLEMENTS: IOSLocalLLM/IOSLocalLLM.entitlements
         CODE_SIGN_STYLE: Automatic
         VERSIONING_SYSTEM: apple-generic
         CURRENT_PROJECT_VERSION: "146"
-        # iPhone-only server surface.
-        TARGETED_DEVICE_FAMILY: "1"
+        # iPhone + iPad server surface.
+        TARGETED_DEVICE_FAMILY: "1,2"
         SUPPORTS_MACCATALYST: NO
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS: YES
@@ -255,10 +255,10 @@ targets:
       - target: OnDeviceLAS
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.mesutcydev.ondevicelas.tests
+        PRODUCT_BUNDLE_IDENTIFIER: com.local.ondevicelas.tests
         INFOPLIST_FILE: ""   # auto-generate
         CODE_SIGN_STYLE: Automatic
-        TARGETED_DEVICE_FAMILY: "1"
+        TARGETED_DEVICE_FAMILY: "1,2"
         GENERATE_INFOPLIST_FILE: YES
         SWIFT_EMIT_LOC_STRINGS: NO
         # Clear the bridging header — tests only test Swift code.

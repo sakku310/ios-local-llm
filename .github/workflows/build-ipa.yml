@@ -1,0 +1,300 @@
+name: Build Unsigned iOS IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - phase1-ci-ipa
+
+permissions:
+  contents: read
+
+jobs:
+  build-unsigned-ipa:
+    name: build-ondevicelas-unsigned-ipa
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository without submodules
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: false
+          persist-credentials: false
+
+      - name: Initialize only llama.cpp submodule at pinned commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git submodule update --init --depth 1 -- ThirdParty/llama.cpp
+
+          expected_llama_commit="7ef790f90a4772eadd6966815f6d3ae7d93c7e03"
+          actual_llama_commit="$(git -C "${GITHUB_WORKSPACE}/ThirdParty/llama.cpp" rev-parse HEAD)"
+          echo "ThirdParty/llama.cpp HEAD: ${actual_llama_commit}"
+          if [[ "${actual_llama_commit}" != "${expected_llama_commit}" ]]; then
+            echo "error: unexpected llama.cpp commit ${actual_llama_commit} (expected ${expected_llama_commit})" >&2
+            exit 1
+          fi
+
+          if [[ -f "${GITHUB_WORKSPACE}/ThirdParty/whisper.cpp/CMakeLists.txt" ]]; then
+            echo "error: ThirdParty/whisper.cpp must remain uninitialized for OnDeviceLAS" >&2
+            exit 1
+          fi
+
+      - name: Verify Xcode 26, iOS SDK, Metal Toolchain, and build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sw_vers
+          sysctl hw.ncpu hw.memsize
+          df -h
+          xcodebuild -version
+          xcodebuild -showsdks | grep -i ios
+
+          # `xcrun -f metal` can succeed on Xcode's stub binary even when the
+          # optional Metal Toolchain component is not installed; verify with
+          # `metal --version` and a real `.metal` -> `.air` compilation check.
+          if ! xcrun --sdk iphoneos metal --version >/dev/null 2>&1; then
+            echo "iOS Metal Toolchain is missing; downloading metalToolchain..."
+            xcodebuild -downloadComponent metalToolchain
+          fi
+
+          xcrun --sdk iphoneos metal --version
+
+          metal_probe_dir="$(mktemp -d "${RUNNER_TEMP:-/tmp}/metal-probe.XXXXXX")"
+          trap 'rm -rf "${metal_probe_dir}"' EXIT
+          cat > "${metal_probe_dir}/probe.metal" <<'METAL'
+          #include <metal_stdlib>
+          using namespace metal;
+          kernel void ci_probe() {}
+          METAL
+
+          if ! xcrun --sdk iphoneos metal -c "${metal_probe_dir}/probe.metal" -o "${metal_probe_dir}/probe.air"; then
+            echo "error: failed to compile minimal iOS Metal shader with xcrun --sdk iphoneos metal" >&2
+            xcodebuild -showComponent metalToolchain >&2 || true
+            exit 1
+          fi
+          if [[ ! -s "${metal_probe_dir}/probe.air" ]]; then
+            echo "error: compiled Metal probe output ${metal_probe_dir}/probe.air is missing or empty" >&2
+            exit 1
+          fi
+          echo "Verified iOS Metal shader compilation (${metal_probe_dir}/probe.air)"
+
+          for tool in cmake xcodegen pod; do
+            if ! command -v "${tool}" >/dev/null 2>&1; then
+              case "${tool}" in
+                cmake) brew install cmake ;;
+                xcodegen) brew install xcodegen ;;
+                pod) brew install cocoapods ;;
+              esac
+            fi
+          done
+          cmake --version | head -n 1
+          xcodegen --version
+          pod --version
+
+      - name: Build llama.cpp iOS device arm64 XCFramework and remove intermediates
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${GITHUB_WORKSPACE:-}" || ! -f "${GITHUB_WORKSPACE}/ThirdParty/llama.cpp/build-xcframework.sh" ]]; then
+            echo "error: ThirdParty/llama.cpp/build-xcframework.sh is missing" >&2
+            exit 1
+          fi
+
+          llama_root="${GITHUB_WORKSPACE}/ThirdParty/llama.cpp"
+          helper_file="$(mktemp "${RUNNER_TEMP:-/tmp}/llama-xcframework-helpers.XXXXXX")"
+          trap 'rm -f "${helper_file}"' EXIT
+
+          # Source upstream options and packaging helpers from pinned llama.cpp
+          # so we build ONLY the iOS device arm64 slice (skipping Simulator arm64+x86_64).
+          awk '
+            /^IOS_MIN_OS_VERSION=/ { copying = 1 }
+            /^check_required_tool\(\)/ && copying { copying = 0 }
+            /^setup_framework_structure\(\)/ { copying = 1 }
+            /^# Create dynamic libraries from static libraries\./ && copying { copying = 0 }
+            /^combine_static_libraries\(\)/ { copying = 1 }
+            /^echo "Building for iOS simulator/ && copying { copying = 0 }
+            copying { print }
+          ' "${llama_root}/build-xcframework.sh" > "${helper_file}"
+
+          (
+            cd "${llama_root}"
+            # shellcheck disable=SC1090
+            source "${helper_file}"
+            if ! declare -F setup_framework_structure >/dev/null ||
+               ! declare -F combine_static_libraries >/dev/null; then
+              echo "error: failed to load XCFramework packaging helpers from build-xcframework.sh" >&2
+              exit 1
+            fi
+
+            rm -rf build-apple build-ios-device
+
+            echo "Building llama.cpp for iOS device (arm64 only)..."
+            cmake -B build-ios-device -G Xcode \
+              "${COMMON_CMAKE_ARGS[@]}" \
+              -DCMAKE_OSX_DEPLOYMENT_TARGET="${IOS_MIN_OS_VERSION}" \
+              -DCMAKE_SYSTEM_NAME=iOS \
+              -DCMAKE_OSX_SYSROOT=iphoneos \
+              -DCMAKE_OSX_ARCHITECTURES="arm64" \
+              -DCMAKE_XCODE_ATTRIBUTE_SUPPORTED_PLATFORMS=iphoneos \
+              -DCMAKE_C_FLAGS="${COMMON_C_FLAGS}" \
+              -DCMAKE_CXX_FLAGS="${COMMON_CXX_FLAGS}" \
+              -DLLAMA_OPENSSL=OFF \
+              -DMTMD_VIDEO=OFF \
+              -S .
+            cmake --build build-ios-device --config Release -j 2 -- -quiet
+
+            setup_framework_structure "build-ios-device" "${IOS_MIN_OS_VERSION}" "ios"
+            combine_static_libraries "build-ios-device" "Release-iphoneos" "ios" "false"
+
+            mkdir -p build-apple
+            xcrun xcodebuild -create-xcframework \
+              -framework "$(pwd)/build-ios-device/framework/llama.framework" \
+              -debug-symbols "$(pwd)/build-ios-device/dSYMs/llama.dSYM" \
+              -output "$(pwd)/build-apple/llama.xcframework"
+          )
+
+          xcframework_dir="${llama_root}/build-apple/llama.xcframework"
+          device_binary="${xcframework_dir}/ios-arm64/llama.framework/llama"
+          if [[ ! -s "${device_binary}" ]]; then
+            echo "error: expected device framework binary not found at ${device_binary}" >&2
+            exit 1
+          fi
+          ls -la "${xcframework_dir}"
+
+          # Remove intermediate CMake/Xcode build directory inside GITHUB_WORKSPACE
+          rm -rf "${llama_root}/build-ios-device"
+          df -h
+
+      - name: Generate Xcode project and CocoaPods workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "${GITHUB_WORKSPACE}"
+
+          proj_resolved="OnDeviceLAS.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved"
+          ws_resolved="OnDeviceLAS.xcworkspace/xcshareddata/swiftpm/Package.resolved"
+          git ls-files --error-unmatch "${proj_resolved}" "${ws_resolved}" >/dev/null
+
+          xcodegen generate
+          pod install
+
+          # Restore Git-tracked SwiftPM lockfiles after xcodegen and CocoaPods regeneration
+          git checkout -- "${proj_resolved}" "${ws_resolved}"
+
+          if [[ ! -s "${proj_resolved}" || ! -s "${ws_resolved}" ]]; then
+            echo "error: restored SwiftPM Package.resolved file is missing or empty" >&2
+            exit 1
+          fi
+          if ! cmp -s "${proj_resolved}" "${ws_resolved}"; then
+            echo "error: restored SwiftPM Package.resolved files differ between project and workspace" >&2
+            exit 1
+          fi
+          echo "Verified restored SwiftPM Package.resolved files match"
+
+      - name: Resolve SwiftPM dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -resolvePackageDependencies \
+            -workspace "${GITHUB_WORKSPACE}/OnDeviceLAS.xcworkspace" \
+            -scheme OnDeviceLAS \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath "${GITHUB_WORKSPACE}/build"
+          df -h
+
+      - name: Build unsigned Release iOS app (arm64 device slice)
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild build \
+            -workspace "${GITHUB_WORKSPACE}/OnDeviceLAS.xcworkspace" \
+            -scheme OnDeviceLAS \
+            -destination "generic/platform=iOS" \
+            -configuration Release \
+            -derivedDataPath "${GITHUB_WORKSPACE}/build" \
+            -jobs 2 \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            DEVELOPMENT_TEAM="" \
+            VALIDATE_PRODUCT=NO
+
+      - name: Verify app bundle metadata and package unsigned IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${GITHUB_WORKSPACE:-}" || ! -d "${GITHUB_WORKSPACE}" ]]; then
+            echo "error: invalid GITHUB_WORKSPACE" >&2
+            exit 1
+          fi
+
+          app_path="${GITHUB_WORKSPACE}/build/Build/Products/Release-iphoneos/OnDeviceLAS.app"
+          if [[ ! -d "${app_path}" ]]; then
+            echo "error: built app bundle not found at ${app_path}" >&2
+            exit 1
+          fi
+
+          # Free compiler intermediates before duplicating Payload/ and zipping IPA on 14 GB SSD
+          rm -rf "${GITHUB_WORKSPACE}/build/Build/Intermediates.noindex"
+
+          python3 - "${app_path}/Info.plist" <<'PY'
+          import plistlib
+          import sys
+
+          plist_path = sys.argv[1]
+          with open(plist_path, "rb") as f:
+              info = plistlib.load(f)
+
+          bundle_id = info.get("CFBundleIdentifier")
+          device_family = info.get("UIDeviceFamily", [])
+          print(f"Verified CFBundleIdentifier: {bundle_id}")
+          print(f"Verified UIDeviceFamily: {device_family}")
+
+          if bundle_id != "com.local.ondevicelas":
+              raise SystemExit(f"error: unexpected CFBundleIdentifier {bundle_id!r}")
+          if not ({1, 2}.issubset(set(device_family))):
+              raise SystemExit(f"error: UIDeviceFamily {device_family!r} does not include both iPhone (1) and iPad (2)")
+          PY
+
+          if [[ -e "${app_path}/embedded.mobileprovision" || -d "${app_path}/_CodeSignature" ]]; then
+            echo "warning: unexpected signing artifacts present in unsigned build" >&2
+          fi
+
+          payload_dir="${GITHUB_WORKSPACE}/Payload"
+          ipa_path="${GITHUB_WORKSPACE}/OnDeviceLAS-unsigned.ipa"
+          rm -rf "${payload_dir}" "${ipa_path}"
+          mkdir -p "${payload_dir}"
+          cp -RP "${app_path}" "${payload_dir}/OnDeviceLAS.app"
+          (
+            cd "${GITHUB_WORKSPACE}"
+            zip -qryy OnDeviceLAS-unsigned.ipa Payload
+          )
+          rm -rf "${payload_dir}"
+
+          if [[ ! -s "${ipa_path}" ]]; then
+            echo "error: failed to create ${ipa_path}" >&2
+            exit 1
+          fi
+
+          ipa_entries="$(zipinfo -1 "${ipa_path}")"
+          for required_entry in \
+            "Payload/OnDeviceLAS.app/OnDeviceLAS" \
+            "Payload/OnDeviceLAS.app/Info.plist" \
+            "Payload/OnDeviceLAS.app/Frameworks/llama.framework/llama"; do
+            if ! grep -Fxq "${required_entry}" <<<"${ipa_entries}"; then
+              echo "error: missing required entry '${required_entry}' inside ${ipa_path}" >&2
+              exit 1
+            fi
+          done
+          echo "Verified Payload/OnDeviceLAS.app structure inside OnDeviceLAS-unsigned.ipa"
+          ls -lh "${ipa_path}"
+          df -h
+
+      - name: Upload unsigned IPA artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: OnDeviceLAS-unsigned.ipa
+          path: OnDeviceLAS-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 14
