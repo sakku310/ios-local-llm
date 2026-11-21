@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - phase1-ci-ipa
+      - temp-ci-verify-1795239586
 
 permissions:
   contents: read
