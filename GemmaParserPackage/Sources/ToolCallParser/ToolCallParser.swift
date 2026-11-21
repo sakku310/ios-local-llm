@@ -138,7 +138,27 @@ struct ToolCallParser {
                 let name = (rawName == "web_search" || rawName == "websearch") ? "web_search" : rawName
                 guard name == "web_search" else { return }
                 let argsBody = String(trimmed[argsRange])
-                var argsDict: [String: Any] = [:]
+                // Minimal JSON‑compatible wrapper – keeps the original
+                // semantics (Int, Double, Bool, String) while satisfying
+                // `Encodable`.  No array / object / null handling is added
+                // because the parser never produces those types.
+                enum JSONValue: Encodable {
+                    case int(Int)
+                    case double(Double)
+                    case bool(Bool)
+                    case string(String)
+
+                    func encode(to encoder: Encoder) throws {
+                        var container = encoder.singleValueContainer()
+                        switch self {
+                        case .int(let v):   try container.encode(v)
+                        case .double(let v):try container.encode(v)
+                        case .bool(let v):  try container.encode(v)
+                        case .string(let v):try container.encode(v)
+                        }
+                    }
+                }
+                var argsDict: [String: JSONValue] = [:]
 
                 // Quoted string arguments: key:<|"|>value<|"|>
                 let kvPattern = #"(\w+):<\|\"\|>(.*?)<\|\"\|>"#
@@ -151,15 +171,15 @@ struct ToolCallParser {
                         let key = String(argsBody[keyRange])
                         let rawVal = String(argsBody[valRange])
                         if let intVal = Int(rawVal) {
-                            argsDict[key] = intVal
+                            argsDict[key] = .int(intVal)
                         } else if let doubleVal = Double(rawVal) {
-                            argsDict[key] = doubleVal
+                            argsDict[key] = .double(doubleVal)
                         } else if rawVal.lowercased() == "true" {
-                            argsDict[key] = true
+                            argsDict[key] = .bool(true)
                         } else if rawVal.lowercased() == "false" {
-                            argsDict[key] = false
+                            argsDict[key] = .bool(false)
                         } else {
-                            argsDict[key] = rawVal
+                            argsDict[key] = .string(rawVal)
                         }
                     }
                 }
@@ -175,15 +195,15 @@ struct ToolCallParser {
                         if argsDict[key] != nil { return }
                         let rawVal = String(argsBody[valRange])
                         if let intVal = Int(rawVal) {
-                            argsDict[key] = intVal
+                            argsDict[key] = .int(intVal)
                         } else if let doubleVal = Double(rawVal) {
-                            argsDict[key] = doubleVal
+                            argsDict[key] = .double(doubleVal)
                         } else if rawVal.lowercased() == "true" {
-                            argsDict[key] = true
+                            argsDict[key] = .bool(true)
                         } else if rawVal.lowercased() == "false" {
-                            argsDict[key] = false
+                            argsDict[key] = .bool(false)
                         } else {
-                            argsDict[key] = rawVal
+                            argsDict[key] = .string(rawVal)
                         }
                     }
                 }
