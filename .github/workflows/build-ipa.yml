@@ -71,7 +71,7 @@ jobs:
 
           if ! xcrun --sdk iphoneos metal -c "${metal_probe_dir}/probe.metal" -o "${metal_probe_dir}/probe.air"; then
             echo "error: failed to compile minimal iOS Metal shader with xcrun --sdk iphoneos metal" >&2
-            xcodebuild -showComponent metalToolchain >&2 || true
+            xcodebuild -showComponent metalToolchain >/dev/null 2>&1 || true
             exit 1
           fi
           if [[ ! -s "${metal_probe_dir}/probe.air" ]]; then
@@ -110,32 +110,25 @@ jobs:
           # Source upstream options and packaging helpers from pinned llama.cpp
           # so we build ONLY arm64 Simulator (for OnDeviceLASTests) + arm64 Device
           # sequentially, deleting each CMake build tree immediately to protect SSD space.
-          awk '
-            /^IOS_MIN_OS_VERSION=/ { copying = 1 }
-            /^check_required_tool\(\)/ && copying { copying = 0 }
-            /^setup_framework_structure\(\)/ { copying = 1 }
-            /^# Create dynamic libraries from static libraries\./ && copying { copying = 0 }
-            /^combine_static_libraries\(\)/ { copying = 1 }
-            /^echo "Building for iOS simulator/ && copying { copying = 0 }
-            copying { print }
+          awk '\
+            /^IOS_MIN_OS_VERSION=/ { copying = 1 }\
+            /^check_required_tool\\(\\)/ && copying { copying = 0 }\
+            /^setup_framework_structure\\(\\)/ { copying = 1 }\
+            /^# Create dynamic libraries from static libraries\\./ && copying { copying = 0 }\
+            /^combine_static_libraries\\(\\)/ { copying = 1 }\
+            /^echo "Building for iOS simulator/ && copying { copying = 0 }\
+            copying { print }\
           ' "${llama_root}/build-xcframework.sh" > "${helper_file}"
 
-          # Normalize ONLY combine_static_libraries() -> case "$platform" -> "ios") -> is_simulator == "true"
-          # inside the temporary helper_file so the Simulator slice links arm64-only (matching CMake),
+          # Normalize ONLY combine_static_libraries() -> case "$platform" -> "ios") -> is_simulator == "true" inside the temporary helper_file so the Simulator slice links arm64-only (matching CMake),
           # without modifying ThirdParty/llama.cpp/build-xcframework.sh.
           python3 - "${helper_file}" <<'PY'
-          import pathlib
-          import re
-          import sys
-
+          import pathlib, re, sys
           helper_path = pathlib.Path(sys.argv[1])
           before = helper_path.read_text(encoding="utf-8")
-
-          func_matches = list(re.finditer(r"^combine_static_libraries\(\)\s*\{", before, flags=re.MULTILINE))
+          func_matches = list(re.finditer(r"^combine_static_libraries\\(\\)\\s*\\{", before, flags=re.MULTILINE))
           if len(func_matches) != 1:
-              raise SystemExit(
-                  f"error: expected 1 combine_static_libraries() definition in {helper_path}, found {len(func_matches)}"
-              )
+              raise SystemExit(f"error: expected 1 combine_static_libraries() definition in {helper_path}, found {len(func_matches)}")
           combine_start = func_matches[0].start()
 
           target_ios_block = (
@@ -166,36 +159,24 @@ jobs:
               '            install_name="@rpath/llama.framework/llama"\n'
               '            ;;\n'
           )
-
           occurrences = before.count(target_ios_block)
           if occurrences != 1:
-              raise SystemExit(
-                  f"error: expected target iOS simulator/device block once in {helper_path}, found {occurrences}"
-              )
+              raise SystemExit(f"error: expected target iOS simulator/device block once in {helper_path}, found {occurrences}")
           block_offset = before.index(target_ios_block)
           if block_offset <= combine_start:
               raise SystemExit("error: target iOS block is outside combine_static_libraries()")
-
-          patched = (
-              before[:block_offset]
-              + replacement_ios_block
-              + before[block_offset + len(target_ios_block):]
-          )
+          patched = before[:block_offset] + replacement_ios_block + before[block_offset + len(target_ios_block):]
           helper_path.write_text(patched, encoding="utf-8")
-
           after = helper_path.read_text(encoding="utf-8")
           if after.count(replacement_ios_block) != 1 or target_ios_block in after:
               raise SystemExit("error: post-write verification failed for normalized iOS block")
-
           after_offset = after.index(replacement_ios_block)
           ios_after = after[after_offset:after_offset + len(replacement_ios_block)]
-          sim_part, device_part = ios_after.split("            else\n", 1)
-
+          sim_part, device_part = ios_after.split('            else\n', 1)
           if "x86_64" in sim_part:
               raise SystemExit("error: x86_64 remained in iOS simulator branch")
           if 'sdk="iphonesimulator"' not in sim_part or 'archs="arm64"' not in sim_part:
               raise SystemExit("error: arm64 simulator settings missing after normalization")
-
           expected_device_part = (
               '                sdk="iphoneos"\n'
               '                archs="arm64"\n'
@@ -206,19 +187,11 @@ jobs:
           )
           if device_part != expected_device_part:
               raise SystemExit("error: iOS device branch was unexpectedly altered")
-
           unchanged_prefix = before[:block_offset] == after[:after_offset]
-          unchanged_suffix = (
-              before[block_offset + len(target_ios_block):]
-              == after[after_offset + len(replacement_ios_block):]
-          )
+          unchanged_suffix = (before[block_offset + len(target_ios_block):] == after[after_offset + len(replacement_ios_block):])
           if not (unchanged_prefix and unchanged_suffix):
               raise SystemExit("error: helper content outside iOS block was unexpectedly modified")
-
-          print(
-              "Verified helper_file normalization: combine_static_libraries() iOS simulator archs='arm64' "
-              "(device branch and all other sections unchanged)"
-          )
+          print("Verified helper_file normalization: combine_static_libraries() iOS simulator archs='arm64' (device branch and all other sections unchanged)")
           PY
           bash -n "${helper_file}"
           git -C "${llama_root}" diff --exit-code -- build-xcframework.sh
@@ -252,7 +225,7 @@ jobs:
 
             setup_framework_structure "build-ios-sim" "${IOS_MIN_OS_VERSION}" "ios"
             combine_static_libraries "build-ios-sim" "Release-iphonesimulator" "ios" "true"
-            mkdir -p "${stage_root}/sim"
+            mkdir -p "${stage_root}/sim/framework"
             mv build-ios-sim/framework "${stage_root}/sim/framework"
             mv build-ios-sim/dSYMs "${stage_root}/sim/dSYMs"
             rm -rf build-ios-sim
@@ -360,17 +333,14 @@ jobs:
             -derivedDataPath "${GITHUB_WORKSPACE}/build"
           df -h
 
-      - name: Run offline unit tests (OnDeviceLASTests)
+      - name: Run unit tests with result bundle
         shell: bash
         env:
           ONDEVICELAS_RUN_LIVE_NETWORK_TESTS: "0"
         run: |
           set -euo pipefail
           sim_udid="$(python3 - <<'PY'
-          import json
-          import subprocess
-          import sys
-
+          import json, subprocess, sys
           raw = subprocess.check_output(["xcrun", "simctl", "list", "devices", "available", "-j"], text=True)
           data = json.loads(raw)
           devices_by_runtime = data.get("devices", {})
@@ -390,16 +360,16 @@ jobs:
               raise SystemExit("error: no available iOS Simulator device found for OnDeviceLASTests")
           candidates.sort(key=lambda item: (item[0]))
           chosen = candidates[0]
-          print(f"Selected simulator: {chosen[2]} ({chosen[1]})", file=sys.stderr)
           print(chosen[3])
           PY
           )"
-
           if [[ -z "${sim_udid}" ]]; then
             echo "error: failed to resolve iOS Simulator UDID" >&2
             exit 1
           fi
 
+          RESULT_BUNDLE="${RUNNER_TEMP}/result-${GITHUB_RUN_ID}.xcresult"
+          set +e
           xcodebuild test \
             -workspace "${GITHUB_WORKSPACE}/OnDeviceLAS.xcworkspace" \
             -scheme OnDeviceLAS \
@@ -411,12 +381,43 @@ jobs:
             -jobs 2 \
             CODE_SIGN_IDENTITY="-" \
             CODE_SIGNING_REQUIRED=NO \
-            DEVELOPMENT_TEAM=""
+            DEVELOPMENT_TEAM="" \
+            -resultBundlePath "$RESULT_BUNDLE"
+          TEST_EXIT=$?
+          set -e
+
+          # Extract summary (numeric if available)
+          METRICS_JSON=$(xcrun xcresulttool get --path "$RESULT_BUNDLE" --format json | jq -r '.metrics')
+          if echo "$METRICS_JSON" | grep -q '"testsPassed"'; then
+            PASSED=$(echo "$METRICS_JSON" | jq -r '.testsPassed')
+            FAILED=$(echo "$METRICS_JSON" | jq -r '.testsFailed')
+            SKIPPED=$(echo "$METRICS_JSON" | jq -r '.testsSkipped')
+            TOTAL=$(echo "$METRICS_JSON" | jq -r '.testsTotal')
+            echo "Test Summary: passed=$PASSED failed=$FAILED skipped=$SKIPPED total=$TOTAL" >"${RUNNER_TEMP}/test_summary.txt"
+          else
+            # Fallback to original string summary
+            SUMMARY=$(echo "$METRICS_JSON" | jq -r '.testResultSummary')
+            echo "Test Summary (fallback): $SUMMARY" >"${RUNNER_TEMP}/test_summary.txt"
+          fi
 
           xcrun simctl shutdown all || true
-          # Reclaim Debug Simulator build products while preserving build/SourcePackages
           rm -rf "${GITHUB_WORKSPACE}/build/Build"
           df -h
+          exit "$TEST_EXIT"
+
+      - name: Upload test result bundle
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: test-result-${{ github.run_id }}
+          path: ${{ env.RUNNER_TEMP }}/result-${{ github.run_id }}.xcresult
+
+      - name: Upload test summary
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: test-summary-${{ github.run_id }}
+          path: ${{ env.RUNNER_TEMP }}/test_summary.txt
 
       - name: Build unsigned Release iOS app (arm64 device slice)
         shell: bash
@@ -453,12 +454,9 @@ jobs:
           # Free compiler intermediates before duplicating Payload/ and zipping IPA on 14 GB SSD
           rm -rf "${GITHUB_WORKSPACE}/build/Build/Intermediates.noindex"
 
-          # 1. Verify Bundle ID and UIDeviceFamily in Info.plist
+          # 1. Verify Bundle ID and UIDDeviceFamily in Info.plist
           python3 - "${app_path}/Info.plist" "${GITHUB_WORKSPACE}/IOSLocalLLM/Models/AppSettings.swift" "${GITHUB_WORKSPACE}/IOSLocalLLM/ContentView.swift" <<'PY'
-          import plistlib
-          import re
-          import sys
-
+          import plistlib, re, sys
           plist_path, settings_path, content_view_path = sys.argv[1], sys.argv[2], sys.argv[3]
           with open(plist_path, "rb") as f:
               info = plistlib.load(f)
@@ -466,12 +464,12 @@ jobs:
           bundle_id = info.get("CFBundleIdentifier")
           device_family = info.get("UIDeviceFamily", [])
           print(f"Verified CFBundleIdentifier: {bundle_id}")
-          print(f"Verified UIDeviceFamily: {device_family}")
+          print(f"Verified UIDDeviceFamily: {device_family}")
 
           if bundle_id != "com.local.ondevicelas":
               raise SystemExit(f"error: unexpected CFBundleIdentifier {bundle_id!r}")
           if not ({1, 2}.issubset(set(device_family))):
-              raise SystemExit(f"error: UIDeviceFamily {device_family!r} does not include both iPhone (1) and iPad (2)")
+              raise SystemExit(f"error: UIDDeviceFamily {device_family!r} does not include both iPhone (1) and iPad (2)")
 
           with open(settings_path, "r", encoding="utf-8") as f:
               settings_src = f.read()
@@ -545,19 +543,126 @@ jobs:
           if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
             {
               echo "### OnDeviceLAS Unsigned IPA Build Summary"
-              echo "- **File**: \`OnDeviceLAS-unsigned.ipa\`"
-              echo "- **Size**: \`${ipa_bytes}\` bytes"
-              echo "- **SHA-256**: \`${ipa_sha256}\`"
-              echo "- **Bundle ID**: \`com.local.ondevicelas\`"
-              echo "- **Default API Port**: \`11434\`"
-            } >> "${GITHUB_STEP_SUMMARY}"
+              echo "- **File**: `OnDeviceLAS-unsigned.ipa`"
+              echo "- **Size**: `${ipa_bytes}` bytes"
+              echo "- **SHA-256**: `${ipa_sha256}`"
+              echo "- **Bundle ID**: `com.local.ondevicelas`"
+              echo "- **Default API Port**: `11434`"
+            } >>"${GITHUB_STEP_SUMMARY}"
           fi
           df -h
 
+      - name: Save IPA metadata log
+        shell: bash
+        if: always()
+        run: |
+          set -euo pipefail
+          IPA_PATH="${GITHUB_WORKSPACE}/OnDeviceLAS-unsigned.ipa"
+          LOG_PATH="${RUNNER_TEMP}/ipa_metadata.txt"
+          if [[ ! -f "$IPA_PATH" ]]; then
+            echo "Error: IPA not found" >&2
+            echo "IPA missing" >"$LOG_PATH"
+            exit 0
+          fi
+          unzip -q "$IPA_PATH" -d "$RUNNER_TEMP/ipa_tmp"
+          PLIST="$RUNNER_TEMP/ipa_tmp/Payload/OnDeviceLAS.app/Info.plist"
+          if [[ ! -f "$PLIST" ]]; then
+            echo "Error: Info.plist missing" >&2
+            echo "Info.plist missing" >"$LOG_PATH"
+            exit 0
+          fi
+          BUNDLE_ID=$(defaults read "$PLIST" CFBundleIdentifier)
+          VERSION=$(defaults read "$PLIST" CFBundleShortVersionString)
+          BUILD=$(defaults read "$PLIST" CFBundleVersion)
+          EXECUTABLE=$(defaults read "$PLIST" CFBundleExecutable)
+          EXEC_PATH="$RUNNER_TEMP/ipa_tmp/Payload/OnDeviceLAS.app/$EXECUTABLE"
+          if [[ -f "$EXEC_PATH" ]]; then
+            SIZE=$(stat -f '%z' "$EXEC_PATH")
+          else
+            SIZE="missing"
+          fi
+          {
+            echo "Bundle ID: $BUNDLE_ID"
+            echo "Version: $VERSION"
+            echo "Build: $BUILD"
+            echo "Executable: $EXECUTABLE"
+            echo "Executable size (bytes): $SIZE"
+          } >"$LOG_PATH"
+          # cleanup
+          rm -rf "$RUNNER_TEMP/ipa_tmp"
+
       - name: Upload unsigned IPA artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
         with:
           name: OnDeviceLAS-unsigned.ipa
           path: OnDeviceLAS-unsigned.ipa
           if-no-files-found: error
           retention-days: 14
+
+      - name: Diagnose code signing (non-blocking)
+        shell: bash
+        if: always()
+        run: |
+          set -euo pipefail
+          APP_BUNDLE="${GITHUB_WORKSPACE}/build/Build/Products/Release-iphoneos/OnDeviceLAS.app"
+          if [[ ! -d "$APP_BUNDLE" ]]; then
+            echo "ERROR: app bundle missing" >"${RUNNER_TEMP}/codesign_log.txt"
+            exit 0
+          fi
+          DVV_LOG="${RUNNER_TEMP}/codesign_dvv.txt"
+          VERIFY_LOG="${RUNNER_TEMP}/codesign_verify.txt"
+          LOG_PATH="${RUNNER_TEMP}/codesign_log.txt"
+          if codesign -dvv "$APP_BUNDLE" >"$DVV_LOG" 2>&1; then
+            DVV_EXIT=0
+          else
+            DVV_EXIT=$?
+          fi
+          if codesign --verify --deep --strict "$APP_BUNDLE" >"$VERIFY_LOG" 2>&1; then
+            VERIFY_EXIT=0
+          else
+            VERIFY_EXIT=$?
+          fi
+          cat "$DVV_LOG" "$VERIFY_LOG" >"$LOG_PATH"
+          classify_codesign() {
+            local dvv_exit=$1
+            local verify_exit=$2
+            local log_path=$3
+            # Detection patterns (conservative exact line match)
+            local unsigned_pat='^code object is not signed$'
+            local signed_pat='code object is signed|signed code object'
+            # Capture matches (ignore STATUS line which is not yet in the file)
+            local has_unsigned=$(grep -Eix "$unsigned_pat" "$log_path" || true)
+            local has_signed=$(grep -Ei "$signed_pat" "$log_path" || true)
+            # Highest‑priority contradictions
+            if [[ -n $has_unsigned && -n $has_signed ]]; then
+              echo "STATUS: UNKNOWN" >>"$log_path"
+            elif [[ $verify_exit -eq 0 && -n $has_unsigned ]]; then
+              echo "STATUS: UNKNOWN" >>"$log_path"
+            # VERIFIED
+            elif [[ $verify_exit -eq 0 && -z $has_unsigned ]]; then
+              echo "STATUS: VERIFIED" >>"$log_path"
+            # UNSIGNED
+            elif [[ $verify_exit -ne 0 && -n $has_unsigned && -z $has_signed ]]; then
+              echo "STATUS: UNSIGNED" >>"$log_path"
+            else
+              echo "STATUS: UNKNOWN" >>"$log_path"
+            fi
+          }
+          classify_codesign "$DVV_EXIT" "$VERIFY_EXIT" "$LOG_PATH"
+
+      - name: Upload IPA metadata log
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: ipa-metadata-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ipa_metadata.txt
+          if-no-files-found: warn
+
+      - name: Upload codesign diagnostic log
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: codesign-log-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/codesign_log.txt
+          if-no-files-found: warn
