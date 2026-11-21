@@ -10,4 +10,4 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Run Gemma parser unit tests
-        run: swift test --package-path Packages/coreai-models/swift --filter ToolCallParserGemma
+        run: swift test --package-path GemmaParserPackage
