@@ -126,7 +126,7 @@ jobs:
           import pathlib, re, sys
           helper_path = pathlib.Path(sys.argv[1])
           before = helper_path.read_text(encoding="utf-8")
-          func_matches = list(re.finditer(r"^combine_static_libraries\\(\\)\\s*\\{", before, flags=re.MULTILINE))
+          func_matches = list(re.finditer(r"^combine_static_libraries\(\)\s*\{", before, flags=re.MULTILINE))
           if len(func_matches) != 1:
               raise SystemExit(f"error: expected 1 combine_static_libraries() definition in {helper_path}, found {len(func_matches)}")
           combine_start = func_matches[0].start()
