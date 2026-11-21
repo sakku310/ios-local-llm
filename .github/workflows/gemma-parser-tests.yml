@@ -1,0 +1,13 @@
+name: Gemma Parser Tests
+
+on:
+  push: {}
+  pull_request: {}
+
+jobs:
+  gemma-tests:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Run Gemma parser unit tests
+        run: swift test --package-path Packages/coreai-models/swift --filter ToolCallParserGemma
